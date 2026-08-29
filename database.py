@@ -9,6 +9,22 @@ DB_PATH = Path(__file__).resolve().parent / "memory.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 _lock = threading.Lock()
 cursor = conn.cursor()
+
+#sqlite-vec adds vector similarity search to THIS same DB file (an extra virtual table, not a
+#separate store). If it can't load (extension missing, or a Python built without extension
+#support), the bot still runs fully - the vector functions below just no-op and recall is
+#skipped. EMBED_DIM must match the model used in embeddings.py (text-embedding-004 -> 768).
+EMBED_DIM = 768
+try:
+    import sqlite_vec
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    VECTOR_ENABLED = True
+except Exception as _vec_err:  #ImportError, or AttributeError if the build lacks extension support
+    import logging as _logging
+    _logging.getLogger(__name__).warning("Vector search disabled (sqlite-vec unavailable): %s", _vec_err)
+    VECTOR_ENABLED = False
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS conversation (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +78,67 @@ except sqlite3.OperationalError:
     pass  #column already exists
 cursor.execute("INSERT OR IGNORE INTO conversations (id, title) VALUES (1, 'Conversation 1')")
 conn.commit()
+
+#Vector store: one metadata table holding the raw text + provenance, and a parallel sqlite-vec
+#virtual table holding the embeddings (rowid = embeddings.id). Everything embeddable - messages,
+#memory facts, emails - lives here in one searchable space, keyed by `source`. `ref` is an
+#optional external id (e.g. a gmail message id) so the same item isn't embedded twice.
+if VECTOR_ENABLED:
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            text TEXT,
+            ref TEXT,
+            created REAL DEFAULT (unixepoch())
+        )
+    ''')
+    cursor.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(embedding float[{EMBED_DIM}])")
+    conn.commit()
+
+def add_embedding(source: str, text: str, embedding: list, ref: str | None = None) -> None:
+    """Stores a text and its vector for later semantic recall. `source` tags provenance
+    ('message' | 'memory' | 'email'); `ref` is an optional external id used for dedup.
+    No-ops if the vector extension isn't available or the embedding is empty."""
+    if not VECTOR_ENABLED or not embedding:
+        return
+    with _lock:
+        cursor.execute("INSERT INTO embeddings (source, text, ref) VALUES (?, ?, ?)", (source, text, ref))
+        row_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO vec_embeddings (rowid, embedding) VALUES (?, ?)",
+            (row_id, sqlite_vec.serialize_float32(embedding)),
+        )
+        conn.commit()
+
+def embedding_ref_exists(ref: str) -> bool:
+    """True if an item with this external ref was already embedded (dedup for e.g. emails)."""
+    if not VECTOR_ENABLED:
+        return False
+    with _lock:
+        cursor.execute("SELECT 1 FROM embeddings WHERE ref = ?", (ref,))
+        return cursor.fetchone() is not None
+
+def search_embeddings(embedding: list, k: int = 5, sources: list | None = None) -> list:
+    """Returns up to k stored texts most similar to `embedding`, nearest first, as
+    [{'source', 'text', 'distance'}]. `sources` optionally restricts which kinds to return.
+    Empty list if vectors are disabled or the query embedding is empty."""
+    if not VECTOR_ENABLED or not embedding:
+        return []
+    #sqlite-vec KNN wants the MATCH+LIMIT isolated; join to the metadata table around it.
+    #Over-fetch when filtering by source so the post-filter can still return up to k.
+    fetch = k * 4 if sources else k
+    with _lock:
+        rows = cursor.execute(
+            "SELECT e.source, e.text, v.distance FROM ("
+            "  SELECT rowid, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?"
+            ") v JOIN embeddings e ON e.id = v.rowid ORDER BY v.distance",
+            (sqlite_vec.serialize_float32(embedding), fetch),
+        ).fetchall()
+    results = [{"source": r[0], "text": r[1], "distance": r[2]} for r in rows]
+    if sources:
+        results = [r for r in results if r["source"] in sources]
+    return results[:k]
 
 def clear_conversation(conversation_id: int):
     with _lock:
