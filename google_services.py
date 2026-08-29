@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import threading
 from datetime import datetime, timezone
@@ -76,6 +77,11 @@ def _calendar():
 
 def _drive():
     return build("drive", "v3", credentials=_get_credentials())
+
+
+def _sheets():
+    #Sheets API is authorized by the existing full 'drive' scope - no new scope/token needed
+    return build("sheets", "v4", credentials=_get_credentials())
 
 
 # Gmail
@@ -331,5 +337,103 @@ def drive_upload_file(name: str, content: str, mime_type: str = "text/plain") ->
         media = MediaInMemoryUpload(content.encode("utf-8"), mimetype=mime_type)
         created = service.files().create(body={"name": name}, media_body=media, fields="id,webViewLink").execute()
         return f"File created: {name}\n{created.get('webViewLink')}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# Sheets
+
+SHEETS_MAX_ROWS = 100  # cap read output so a huge sheet doesn't flood the model's context
+
+
+def _parse_values(values_json: str) -> list:
+    """Parses a JSON 2D array (list of rows, each a list of cells) for a write. Raises
+    ValueError with a clear message if the shape is wrong, so the tool returns a helpful
+    error instead of a raw traceback."""
+    data = json.loads(values_json)  # may raise json.JSONDecodeError (a ValueError subclass)
+    if not isinstance(data, list) or not all(isinstance(row, list) for row in data):
+        raise ValueError("values_json must be a JSON array of arrays, e.g. [[\"Name\",\"Age\"],[\"Ori\",22]]")
+    return data
+
+
+def sheets_read(spreadsheet_id: str, range: str = "") -> str:
+    """Reads the contents of a Google Sheet so you can see what's in it. To find a
+    spreadsheet's id, use drive_list_files (spreadsheets have mimeType
+    'application/vnd.google-apps.spreadsheet') and take the id from the result.
+
+    Args:
+        spreadsheet_id: The spreadsheet's id (the long token in its URL, or from drive_list_files).
+        range: An A1-notation range like 'Sheet1!A1:D20'. Leave empty to list the tab names and dump the first tab's cells.
+    """
+    try:
+        service = _sheets()
+        if not range:
+            meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title").execute()
+            titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+            if not titles:
+                return "This spreadsheet has no tabs."
+            range = titles[0]  # default to the first tab
+            header = f"Tabs: {', '.join(titles)}\nShowing '{titles[0]}':\n"
+        else:
+            header = f"{range}:\n"
+        result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range).execute()
+        rows = result.get("values", [])
+        if not rows:
+            return header + "(no data in this range)"
+        shown = rows[:SHEETS_MAX_ROWS]
+        body = "\n".join(" | ".join(str(cell) for cell in row) for row in shown)
+        if len(rows) > SHEETS_MAX_ROWS:
+            body += f"\n... ({len(rows) - SHEETS_MAX_ROWS} more rows not shown - request a narrower range to see them)"
+        return header + body
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def sheets_update(spreadsheet_id: str, range: str, values_json: str) -> str:
+    """Writes values into a specific range of a Google Sheet, OVERWRITING whatever is there.
+    Read the sheet first with sheets_read so you target the right cells. To only add new rows
+    without overwriting, use sheets_append instead.
+
+    Args:
+        spreadsheet_id: The spreadsheet's id.
+        range: The A1-notation range to write to, e.g. 'Sheet1!A2:C4'. Its size should match the values.
+        values_json: A JSON 2D array of the cell values, e.g. '[["Ori", 22], ["Sam", 30]]'.
+    """
+    try:
+        values = _parse_values(values_json)
+        service = _sheets()
+        result = service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=range,
+            valueInputOption="USER_ENTERED",  # interprets formulas/dates like typing in the UI
+            body={"values": values},
+        ).execute()
+        return f"Updated {result.get('updatedCells', 0)} cell(s) in {result.get('updatedRange', range)}."
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def sheets_append(spreadsheet_id: str, values_json: str, range: str = "Sheet1") -> str:
+    """Appends new rows to the bottom of a Google Sheet's existing data - a safe way to add
+    entries without overwriting anything.
+
+    Args:
+        spreadsheet_id: The spreadsheet's id.
+        values_json: A JSON 2D array of the rows to add, e.g. '[["Ori", 22], ["Sam", 30]]'.
+        range: The tab (or A1 range) identifying the table to append to. Defaults to 'Sheet1'.
+    """
+    try:
+        values = _parse_values(values_json)
+        service = _sheets()
+        result = service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range=range,
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+        updated = result.get("updates", {})
+        return f"Appended {updated.get('updatedRows', 0)} row(s) to {updated.get('updatedRange', range)}."
+    except ValueError as e:
+        return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"

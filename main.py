@@ -79,6 +79,9 @@ tool_dict = {
     "drive_read_file": gs.drive_read_file,
     "drive_upload_file": gs.drive_upload_file,
     "drive_download_file": gs.drive_download_file,
+    "sheets_read": gs.sheets_read,
+    "sheets_update": gs.sheets_update,
+    "sheets_append": gs.sheets_append,
     "schedule_task": t.schedule_task,
     "run_background": t.run_background,
     "read_process_output": t.read_process_output,
@@ -157,7 +160,7 @@ screenshot_tools = {"browser_navigate", "browser_screenshot", "browser_click", "
 #or inbox may have changed) or paging through content (scroll). These skip the duplicate
 #check; the iteration cap still limits them. Action tools (write_file, gmail_send_email,
 #browser_click...) keep the strict check - repeating those identically means a stuck loop.
-duplicate_exempt_tools = {"browser_screenshot", "browser_get_elements", "browser_current_url", "browser_scroll", "read_memory", "read_file", "list_directory", "load_skill", "gmail_list_messages", "gmail_read_message", "calendar_list_events", "drive_list_files", "drive_read_file"}
+duplicate_exempt_tools = {"browser_screenshot", "browser_get_elements", "browser_current_url", "browser_scroll", "read_memory", "read_file", "list_directory", "load_skill", "gmail_list_messages", "gmail_read_message", "calendar_list_events", "drive_list_files", "drive_read_file", "sheets_read"}
 MAX_TOOL_ITERATIONS = 20
 PERSIST_MAX_TOOL_ITERATIONS = 100
 TELEGRAM_MAX_MESSAGE_CHARS = 4000 #Telegram rejects messages over 4096 chars - leave headroom
@@ -347,6 +350,9 @@ _TOOL_STATUS: dict[str, str] = {
     "drive_read_file":       "Reading a Drive file...",
     "drive_upload_file":     "Uploading to Drive...",
     "drive_download_file":   "Downloading from Drive...",
+    "sheets_read":           "Reading a spreadsheet...",
+    "sheets_update":         "Updating a spreadsheet...",
+    "sheets_append":         "Adding to a spreadsheet...",
     "save_memory":           "Saving to memory...",
     "read_memory":           "Reading memory...",
     "load_skill":            "Loading a skill...",
