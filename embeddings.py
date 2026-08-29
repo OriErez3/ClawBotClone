@@ -5,16 +5,21 @@ Fails soft: embed_text returns None on any error, so callers store/recall WITHOU
 rather than crashing. The embedding model's output dimension must match database.EMBED_DIM.
 """
 import logging
+import math
 import os
 
 from google import genai
+from google.genai import types
 
 import database
 
 logger = logging.getLogger(__name__)
 
-#text-embedding-004 outputs 768-dim vectors and is cheap; keep in sync with database.EMBED_DIM
-EMBED_MODEL = "text-embedding-004"
+#gemini-embedding-001 defaults to 3072 dims but supports 768 (kept small/cheap); EMBED_DIM in
+#database.py must match. Sub-3072 outputs aren't unit-normalized by the API, so we normalize
+#below - both sqlite-vec's distance and the cosine used for tool selection assume unit vectors.
+EMBED_MODEL = "gemini-embedding-001"
+EMBED_DIM = database.EMBED_DIM
 
 _client: genai.Client | None = None
 
@@ -32,8 +37,13 @@ def embed_text(text: str) -> list | None:
     if not text:
         return None
     try:
-        response = _get_client().models.embed_content(model=EMBED_MODEL, contents=text)
-        return list(response.embeddings[0].values)
+        response = _get_client().models.embed_content(
+            model=EMBED_MODEL, contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+        )
+        values = list(response.embeddings[0].values)
+        norm = math.sqrt(sum(v * v for v in values))
+        return [v / norm for v in values] if norm else values  #unit-normalize for cosine/L2
     except Exception as e:
         logger.warning("Embedding failed: %s", e)
         return None
@@ -60,17 +70,21 @@ def forget(ref: str) -> None:
     database.delete_embeddings_by_ref(ref)
 
 def recall(query: str, k: int = 5, exclude: set | None = None) -> list:
-    """Returns up to k stored texts semantically similar to `query`, nearest first, each a
-    {'source', 'text', 'distance'}. `exclude` is a set of texts to drop (e.g. messages already
-    in the recent history window) so recall surfaces things NOT already in context. Empty list
-    if vectors are unavailable or the query can't be embedded - never raises."""
+    """Embeds `query` and returns up to k semantically similar stored texts. Convenience
+    wrapper around recall_with_vector for callers that don't already have the embedding."""
     if not database.VECTOR_ENABLED:
         return []  #skip the embed API call entirely when there's nothing to search
     query = (query or "").strip()
     if not query:
         return []
-    vector = embed_text(query)
-    if not vector:
+    return recall_with_vector(embed_text(query), k, exclude)
+
+def recall_with_vector(vector: list | None, k: int = 5, exclude: set | None = None) -> list:
+    """Returns up to k stored texts most similar to an already-computed `vector`, nearest first,
+    each a {'source', 'text', 'distance'}. `exclude` is a set of texts to drop (e.g. messages
+    already in the recent history window) so recall surfaces things NOT already in context.
+    Lets a caller embed the query once and reuse the vector (e.g. for tool selection too)."""
+    if not vector or not database.VECTOR_ENABLED:
         return []
     fetch = k + (len(exclude) if exclude else 0)  #over-fetch so exclusions still leave up to k
     results = database.search_embeddings(vector, k=fetch)

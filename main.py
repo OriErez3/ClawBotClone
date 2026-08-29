@@ -91,12 +91,102 @@ tool_dict = {
     "stop_process": t.stop_process,
 }
 
-tools = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration.from_callable(client=client, callable=fn)
-        for fn in tool_dict.values()
-    ]
-)
+#Pre-build each tool's declaration once (introspecting a callable isn't free) so a request can
+#cheaply assemble a Tool from any subset of names. `tools` is the full set - the fallback when
+#dynamic selection is off or unavailable.
+_tool_declarations = {
+    name: types.FunctionDeclaration.from_callable(client=client, callable=fn)
+    for name, fn in tool_dict.items()
+}
+tools = types.Tool(function_declarations=list(_tool_declarations.values()))
+
+#Dynamic tool loading: instead of sending all ~40 tool schemas every call, embed each group's
+#intent description and, per message, load only the groups most similar to it (plus CORE_TOOLS).
+#Tools travel in workflow packs (a browser task needs the whole browser group), so we select
+#whole GROUPS, not individual tools. Descriptions are written with user-intent phrasing so they
+#match how people actually ask ("apply to this job" -> browser group).
+CORE_TOOLS = {  #always available regardless of the task
+    "save_memory", "delete_memory", "read_memory",
+    "load_skill", "save_skill", "delete_skill", "web_search",
+}
+TOOL_GROUPS = {
+    "files": {
+        "description": "Working with local files and downloads: list folders, read and write "
+                       "files, find or move files, download a file from a URL, fetch the contents of a web page.",
+        "tools": {"list_directory", "read_file", "write_file", "download_file", "fetch_url", "find_file", "move_file"},
+    },
+    "browser": {
+        "description": "Using a web browser to interact with websites: open pages, read the "
+                       "elements on a page, click buttons and links, type into forms and search "
+                       "boxes, scroll, fill out and submit online forms, apply to jobs, sign in.",
+        "tools": {"browser_navigate", "browser_screenshot", "browser_click", "browser_type",
+                  "browser_scroll", "browser_get_elements", "browser_click_element", "browser_go_back", "browser_current_url"},
+    },
+    "google": {
+        "description": "The user's Google account: read, search and send Gmail email; view and "
+                       "create Google Calendar events; list, read, upload and download Google "
+                       "Drive files; read and edit Google Sheets spreadsheets.",
+        "tools": {"gmail_list_messages", "gmail_read_message", "gmail_send_email", "gmail_mark_as_read",
+                  "calendar_list_events", "calendar_create_event", "drive_list_files", "drive_read_file",
+                  "drive_upload_file", "drive_download_file", "sheets_read", "sheets_update", "sheets_append"},
+    },
+    "processes": {
+        "description": "Running programs, servers and shell commands: run a terminal command, "
+                       "start or stop a long-running background process or server, read its "
+                       "output, type into it, schedule a task to run at a later time.",
+        "tools": {"run_shell", "run_background", "read_process_output", "send_process_input",
+                  "list_processes", "stop_process", "schedule_task"},
+    },
+}
+TOOL_GROUPS_SELECTED = 2  #load this many best-matching groups (plus core) per request
+_group_embeddings: dict[str, list] = {}  #lazily filled cache of group-description embeddings
+
+def _validate_tool_groups() -> None:
+    #Every tool must be reachable via core or some group, or it could never be offered when
+    #dynamic selection is on. Also catch names that don't match a real tool.
+    grouped = set(CORE_TOOLS)
+    for g in TOOL_GROUPS.values():
+        grouped |= g["tools"]
+    registered = set(tool_dict)
+    if grouped - registered:
+        raise RuntimeError(f"tool groups reference unknown tools: {grouped - registered}")
+    if registered - grouped:
+        raise RuntimeError(f"tools not in any group or core (would be unreachable when tools are limited): {registered - grouped}")
+
+_validate_tool_groups()
+
+def _cosine(a: list, b: list) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+def _ensure_group_embeddings() -> dict:
+    """Embeds each group's description once and caches it (in-memory; only a few groups).
+    Returns the cache, which may be partial/empty if embedding failed - callers then fall
+    back to offering all tools."""
+    if _group_embeddings:
+        return _group_embeddings
+    for name, group in TOOL_GROUPS.items():
+        vec = embeddings.embed_text(group["description"])
+        if vec:
+            _group_embeddings[name] = vec
+    return _group_embeddings
+
+def _select_tools(query_vector: list | None) -> types.Tool:
+    """Builds a Tool containing only CORE_TOOLS plus the TOOL_GROUPS_SELECTED groups whose
+    descriptions are most similar to `query_vector`. Falls back to ALL tools if there's no
+    query vector or group embeddings couldn't be built - never leaves the model tool-starved."""
+    if not query_vector:
+        return tools
+    group_vecs = _ensure_group_embeddings()
+    if not group_vecs:
+        return tools
+    ranked = sorted(group_vecs, key=lambda g: _cosine(query_vector, group_vecs[g]), reverse=True)
+    names = set(CORE_TOOLS)
+    for g in ranked[:TOOL_GROUPS_SELECTED]:
+        names |= TOOL_GROUPS[g]["tools"]
+    return types.Tool(function_declarations=[_tool_declarations[n] for n in names])
 
 #Test to make sure everything is working
 async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -577,12 +667,22 @@ def _finalize_reply(response: Any, give_up: bool) -> str:
         return "Sorry, I couldn't come up with a response there. Could you try rephrasing?"
     return final_text
 
-async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool = False, status_callback: Any = None, confirm_callback: Any = None, media_parts: list | None = None, enable_recall: bool = False) -> tuple[str, bool, list[str]]:
+def _prep_context(prompt: str, enable_recall: bool, recent_texts: set, limit_tools: bool) -> tuple[list, Any]:
+    """Blocking work done in one worker-thread hop: embed the message ONCE, then reuse that
+    vector for both semantic recall (older relevant context) and dynamic tool selection. Returns
+    (recalled_results, selected_tool_object). Falls back to all tools if selection is off."""
+    vector = embeddings.embed_text(prompt) if (enable_recall or limit_tools) and prompt else None
+    recalled = embeddings.recall_with_vector(vector, RECALL_K, recent_texts) if enable_recall else []
+    selected = _select_tools(vector) if limit_tools else tools
+    return recalled, selected
+
+async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool = False, status_callback: Any = None, confirm_callback: Any = None, media_parts: list | None = None, enable_recall: bool = False, limit_tools: bool = False) -> tuple[str, bool, list[str]]:
     """Builds a chat from the stored conversation history, sends `prompt` to the model, runs the
     tool loop, and returns (final_text, give_up). Does not touch the conversation history table -
     callers decide what (if anything) to record. media_parts optionally attaches images/audio
     (as types.Part) ahead of the prompt text, for photo/voice messages. enable_recall pulls in
-    semantically-related older context (only for real user messages, not the timer jobs)."""
+    semantically-related older context; limit_tools loads only the tool groups relevant to the
+    message (both only for focused requests, not arbitrary scheduled tasks)."""
     _active_generations.add(chat_id)
     _cancel_requests.discard(chat_id) #a stale /cancel from an earlier task must not kill this one
     try:
@@ -590,14 +690,10 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
         conversation_id = database.get_active_conversation_id()
         conversation = read_conversation(RECENT_HISTORY_MESSAGES, conversation_id) #Recent turns for conversational continuity; older-but-relevant context comes from semantic recall below
         contents=[types.Content(role=msg["role"], parts=[types.Part(text=msg["parts"][0])]) for msg in conversation] #Converts the conversation history into the correct format for Gemini API
-        recalled = ""
-        if enable_recall:
-            #Semantic recall of older context. Exclude what's already in the recent-30 window so
-            #it only surfaces things NOT already in the prompt. Embedding is a network call -
-            #run it off the event loop.
-            recent_texts = {msg["parts"][0] for msg in conversation}
-            results = await asyncio.to_thread(embeddings.recall, prompt, RECALL_K, recent_texts)
-            recalled = "\n".join(f"- ({r['source']}) {r['text']}" for r in results)
+        #Embed the message once (off the event loop) and reuse it for recall + tool selection
+        recent_texts = {msg["parts"][0] for msg in conversation} if enable_recall else set()
+        recall_results, active_tools = await asyncio.to_thread(_prep_context, prompt, enable_recall, recent_texts, limit_tools)
+        recalled = "\n".join(f"- ({r['source']}) {r['text']}" for r in recall_results)
         browser_url = t.browser_current_url() #Grounds the model in the browser's actual current page, regardless of what past conversation text says
         now = datetime.now().astimezone().isoformat() #Grounds the model in the current date/time for resolving relative dates (e.g. calendar events)
         logs = database.get_tool_logs(conversation_id)
@@ -605,7 +701,7 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
         chat = client.aio.chats.create( #The async client - same API, but send_message can be awaited so it doesn't block the event loop
                 model=GEMINI_MODEL,
                 history=contents, #type: ignore
-                config=types.GenerateContentConfig(tools=[tools],
+                config=types.GenerateContentConfig(tools=[active_tools],
                     system_instruction=build_system_instruction(memory, browser_url, now, persist_mode, tool_log, recalled)
             ),)
         #With media attached, the message is a list of Parts (media first, then the text)
@@ -679,7 +775,7 @@ async def _handle_user_request(update: telegram.Update, context: ContextTypes.DE
                 database.set_setting("chat_id", chat_id)
             conversation_id = database.get_active_conversation_id()
             add_to_conversation("user", history_text, conversation_id) #Saves the user's message to the conversation history in the database
-            final_text, _, tool_entries = await _generate_response(user_message, chat_id=int_chat_id, persist_mode=PERSIST_MODE, status_callback=status.update, confirm_callback=confirm, media_parts=media_parts, enable_recall=True)
+            final_text, _, tool_entries = await _generate_response(user_message, chat_id=int_chat_id, persist_mode=PERSIST_MODE, status_callback=status.update, confirm_callback=confirm, media_parts=media_parts, enable_recall=True, limit_tools=True)
             add_to_conversation("model", final_text, conversation_id, tool_log="\n".join(tool_entries)) #Saves the AI's response to the conversation history in the database
             for chunk in _chunk_message(final_text): #Sends the AI's response back to the user on Telegram
                 await update.message.reply_text(chunk)
@@ -947,7 +1043,7 @@ async def _run_unprompted_check(context: ContextTypes.DEFAULT_TYPE, prompt: str,
         typing_task = asyncio.create_task(_keep_typing(context.bot, int_chat_id, stop_typing))
         confirm = _make_confirm_callback(context.bot, int_chat_id, status)
         try:
-            final_text, give_up, tool_entries = await _generate_response(prompt, chat_id=int_chat_id, confirm_callback=confirm)
+            final_text, give_up, tool_entries = await _generate_response(prompt, chat_id=int_chat_id, confirm_callback=confirm, limit_tools=True)
         except Exception:
             logger.exception("Unprompted check failed")
             return
