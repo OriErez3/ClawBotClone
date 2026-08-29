@@ -372,39 +372,28 @@ async def _execute_tool(tool_name: str, args: dict) -> Any:
 def _tool_result_parts(func: Any, tool_name: str, result: Any) -> list:
     """Builds the message parts for one tool's result, attaching an image part if the
     result includes a screenshot. Sending happens once per batch in _run_tool_loop."""
-    if isinstance(result, tuple):
-        # Has both image and element map
+    def _text_part(text: str) -> list:
+        return [types.Part(function_response=types.FunctionResponse(name=tool_name, id=func.id, response={"result": text}))]
+
+    def _image_parts(image_b64: str, note: str) -> list:
+        #A malformed/truncated screenshot must NOT crash the whole tool loop - degrade to a text
+        #note so the model can recover (e.g. read the page with browser_get_elements) and continue.
+        try:
+            image_bytes = base64.b64decode(image_b64)
+        except (ValueError, TypeError) as e:  #binascii.Error subclasses ValueError
+            logger.warning("Bad screenshot from %s (%s); result[:80]=%r", tool_name, e, str(image_b64)[:80])
+            return _text_part("Screenshot could not be captured this time. Use browser_get_elements to read the page instead.")
+        return [
+            types.Part(function_response=types.FunctionResponse(name=tool_name, id=func.id, response={"result": note})),
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+        ]
+
+    if isinstance(result, tuple):  # (screenshot b64, element map)
         image_b64, element_map = result
-        image_bytes = base64.b64decode(image_b64)
-        return [
-            types.Part(
-                function_response=types.FunctionResponse(
-                    name=tool_name,
-                    id=func.id,
-                    response={"result": element_map}
-                )
-            ),
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-        ]
+        return _image_parts(image_b64, element_map)
     if tool_name in screenshot_tools and not result.startswith("Error"):
-        image_bytes = base64.b64decode(result)
-        return [
-            types.Part(
-                function_response=types.FunctionResponse(
-                    name=tool_name,
-                    id=func.id,
-                    response={"result": "Screenshot taken successfully"}
-                )
-            ),
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-        ]
-    return [types.Part(
-        function_response=types.FunctionResponse(
-            name=tool_name,
-            id=func.id,
-            response={"result": result}
-        )
-    )]
+        return _image_parts(result, "Screenshot taken successfully")
+    return _text_part(result)
 
 def _prune_old_screenshots(chat: Any, keep_recent: int = KEEP_RECENT_SCREENSHOTS) -> None:
     """Strips inline image data from older tool-result turns in the live chat history,
