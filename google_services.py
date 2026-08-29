@@ -11,6 +11,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 
+import embeddings
+
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.events",
@@ -143,6 +145,12 @@ def gmail_read_message(message_id: str) -> str:
         payload = msg.get("payload", {})
         headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
         body = _extract_gmail_body(payload)[:2000]
+        #Reading a full email is the bot's signal it cares about this one - embed a concise
+        #summary for long-term recall ("what did that email from X say?"). ref=message id
+        #dedups, so the same email read across multiple check-ins is only embedded once.
+        summary = (f"Email from {headers.get('From', '?')} - subject "
+                   f"'{headers.get('Subject', '(no subject)')}' ({headers.get('Date', '?')}): {body[:500]}")
+        embeddings.remember("email", summary, ref=f"email:{message_id}")
         return (
             f"From: {headers.get('From', '?')}\n"
             f"Subject: {headers.get('Subject', '(no subject)')}\n"

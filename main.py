@@ -563,7 +563,7 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
     try:
         memory = read_memory() #Reads the bot's memory. This memory stores important information only.
         conversation_id = database.get_active_conversation_id()
-        conversation = read_conversation(30, conversation_id) #Reads the recent conversation history to provide context for the AI's response
+        conversation = read_conversation(RECENT_HISTORY_MESSAGES, conversation_id) #Recent turns for conversational continuity; older-but-relevant context comes from semantic recall below
         contents=[types.Content(role=msg["role"], parts=[types.Part(text=msg["parts"][0])]) for msg in conversation] #Converts the conversation history into the correct format for Gemini API
         recalled = ""
         if enable_recall:
@@ -609,6 +609,9 @@ def _chunk_message(text: str) -> list:
     oversized message raises BadRequest and the user would get nothing at all."""
     return [text[i:i + TELEGRAM_MAX_MESSAGE_CHARS] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_CHARS)] or [text]
 
+#Recent turns kept in-context for conversational continuity (recency/order/pronoun resolution).
+#Trimmed from 30 to 10 once semantic recall existed to backfill older-but-relevant context.
+RECENT_HISTORY_MESSAGES = 10
 RECALL_K = 5  #how many semantically-similar past items to pull into the prompt per message
 #Holds references to fire-and-forget background tasks (embedding). Without a live reference
 #the event loop can garbage-collect a running task; the done-callback drops it when finished.
