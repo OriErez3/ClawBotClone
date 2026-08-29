@@ -324,6 +324,30 @@ def _prune_old_screenshots(chat: Any, keep_recent: int = KEEP_RECENT_SCREENSHOTS
             for p in content.parts
         ]
 
+#Tool results whose old output goes stale as the task moves on: browser element maps describe a
+#page the model has already acted on and left. Their text is the biggest text-bloat in a long
+#browser loop, so old ones are collapsed to a placeholder (the recent few stay intact for the
+#current page). Reference-data results (file reads, emails, Drive, sheets) are NOT pruned - the
+#model may still need them turns later.
+PRUNABLE_RESULT_TOOLS = {"browser_get_elements"}
+KEEP_RECENT_TOOL_RESULTS = 3
+
+def _prune_old_tool_results(chat: Any, keep_recent: int = KEEP_RECENT_TOOL_RESULTS) -> None:
+    """Replaces the text of older prunable tool results (stale browser element maps) with a
+    short placeholder, keeping the most recent `keep_recent` intact. The function_response part
+    stays in place (the API requires one per call) - only its payload is shrunk."""
+    history = chat.get_history(curated=True)
+    targets = [  #(content_index, part_index) of each prunable function-response, in order
+        (ci, pi)
+        for ci, content in enumerate(history) if content.parts
+        for pi, p in enumerate(content.parts)
+        if getattr(p, "function_response", None) is not None and p.function_response.name in PRUNABLE_RESULT_TOOLS
+    ]
+    for ci, pi in (targets[:-keep_recent] if keep_recent else targets):
+        fr = history[ci].parts[pi].function_response
+        history[ci].parts[pi] = types.Part(function_response=types.FunctionResponse(
+            name=fr.name, id=fr.id, response={"result": "[earlier page state omitted to save context]"}))
+
 _TOOL_STATUS: dict[str, str] = {
     "run_shell":             "Running a command...",
     "run_background":        "Starting a background process...",
@@ -531,6 +555,7 @@ async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, s
             parts.extend(_tool_result_parts(func, tool_name, result))
         response = await chat.send_message(parts)
         _prune_old_screenshots(chat)
+        _prune_old_tool_results(chat)
     return response, give_up, tool_entries
 
 def _finalize_reply(response: Any, give_up: bool) -> str:
