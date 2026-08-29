@@ -52,6 +52,7 @@ tool_dict = {
     "write_file": t.write_file,
     "download_file": t.download_file,
     "fetch_url": t.fetch_url,
+    "load_tools": t.load_tools,
     "save_memory": t.save_memory,
     "delete_memory": t.delete_memory,
     "read_memory": t.read_memory,
@@ -106,6 +107,7 @@ tools = types.Tool(function_declarations=list(_tool_declarations.values()))
 #whole GROUPS, not individual tools. Descriptions are written with user-intent phrasing so they
 #match how people actually ask ("apply to this job" -> browser group).
 CORE_TOOLS = {  #always available regardless of the task
+    "load_tools",  #lets the model pull in more groups mid-task when it needs a capability it lacks
     "save_memory", "delete_memory", "read_memory",
     "load_skill", "save_skill", "delete_skill", "web_search",
 }
@@ -173,19 +175,26 @@ def _ensure_group_embeddings() -> dict:
             _group_embeddings[name] = vec
     return _group_embeddings
 
-def _select_tools(query_vector: list | None) -> types.Tool:
-    """Builds a Tool containing only CORE_TOOLS plus the TOOL_GROUPS_SELECTED groups whose
-    descriptions are most similar to `query_vector`. Falls back to ALL tools if there's no
-    query vector or group embeddings couldn't be built - never leaves the model tool-starved."""
+def _select_groups(query_vector: list | None) -> set | None:
+    """Returns the set of group names to load for this query - the TOOL_GROUPS_SELECTED groups
+    most similar to `query_vector`. Returns None to mean 'all tools', the safe fallback when
+    there's no query vector or group embeddings couldn't be built."""
     if not query_vector:
-        return tools
+        return None
     group_vecs = _ensure_group_embeddings()
     if not group_vecs:
-        return tools
+        return None
     ranked = sorted(group_vecs, key=lambda g: _cosine(query_vector, group_vecs[g]), reverse=True)
+    return set(ranked[:TOOL_GROUPS_SELECTED])
+
+def _tool_object_for_groups(group_names: set | None) -> types.Tool:
+    """Builds a Tool from CORE_TOOLS plus the given groups' tools. group_names=None -> all tools.
+    Used both for the initial selection and when load_tools expands the set mid-task."""
+    if group_names is None:
+        return tools
     names = set(CORE_TOOLS)
-    for g in ranked[:TOOL_GROUPS_SELECTED]:
-        names |= TOOL_GROUPS[g]["tools"]
+    for g in group_names:
+        names |= TOOL_GROUPS.get(g, {}).get("tools", set())
     return types.Tool(function_declarations=[_tool_declarations[n] for n in names])
 
 #Test to make sure everything is working
@@ -255,7 +264,7 @@ screenshot_tools = {"browser_navigate", "browser_screenshot", "browser_click", "
 #or inbox may have changed) or paging through content (scroll). These skip the duplicate
 #check; the iteration cap still limits them. Action tools (write_file, gmail_send_email,
 #browser_click...) keep the strict check - repeating those identically means a stuck loop.
-duplicate_exempt_tools = {"browser_screenshot", "browser_get_elements", "browser_current_url", "browser_scroll", "read_memory", "read_file", "list_directory", "load_skill", "gmail_list_messages", "gmail_read_message", "calendar_list_events", "drive_list_files", "drive_read_file", "sheets_read"}
+duplicate_exempt_tools = {"browser_screenshot", "browser_get_elements", "browser_current_url", "browser_scroll", "read_memory", "read_file", "list_directory", "load_skill", "gmail_list_messages", "gmail_read_message", "calendar_list_events", "drive_list_files", "drive_read_file", "sheets_read", "load_tools"}
 MAX_TOOL_ITERATIONS = 20
 PERSIST_MAX_TOOL_ITERATIONS = 100
 TELEGRAM_MAX_MESSAGE_CHARS = 4000 #Telegram rejects messages over 4096 chars - leave headroom
@@ -472,6 +481,7 @@ _TOOL_STATUS: dict[str, str] = {
     "sheets_read":           "Reading a spreadsheet...",
     "sheets_update":         "Updating a spreadsheet...",
     "sheets_append":         "Adding to a spreadsheet...",
+    "load_tools":            "Loading more tools...",
     "save_memory":           "Saving to memory...",
     "read_memory":           "Reading memory...",
     "load_skill":            "Loading a skill...",
@@ -583,10 +593,12 @@ def _make_confirm_callback(bot: Any, chat_id: int, status: Any = None):
         return approved
     return confirm
 
-async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, status_callback: Any = None, conversation_id: int = 0, confirm_callback: Any = None, chat_id: int = 0) -> tuple[Any, bool, list[str]]:
+async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, status_callback: Any = None, conversation_id: int = 0, confirm_callback: Any = None, chat_id: int = 0, rebuild_chat: Any = None, active_groups: set | None = None) -> tuple[Any, bool, list[str]]:
     """Repeatedly executes tool calls requested by the model until it stops calling tools,
     a duplicate call is detected, or the iteration cap is exceeded. Returns the final
-    response, whether the loop gave up early, and a compact log of every tool call made."""
+    response, whether the loop gave up early, and a compact log of every tool call made.
+    When the model calls load_tools, the requested groups are added to `active_groups` and the
+    chat is rebuilt (via rebuild_chat) with the expanded tool set before the next model turn."""
     seen_calls = set()
     give_up = False
     iteration_count = 0
@@ -599,6 +611,7 @@ async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, s
         #over the old one
         parts = []
         stop_executing = False #Set when the cap/duplicate check trips mid-batch; the rest get a skip message
+        needs_rebuild = False #Set when load_tools expanded the group set; rebuild before the next turn
         for func in response.function_calls:
             call_key = f"{func.name}_{func.args}"
             tool_name = func.name
@@ -624,6 +637,26 @@ async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, s
                     result = "This approach isn't working. Tell the user you're unable to complete the task and ask them for more information."
                     give_up = True
                     stop_executing = True
+            elif tool_name == "load_tools":
+                #Meta-tool: expand the loaded tool groups instead of executing anything. Handled
+                #here (not via _execute_tool) so it can trigger the chat rebuild below.
+                seen_calls.add(call_key)
+                if active_groups is None:
+                    result = "You already have all tools available - no need to load more."
+                else:
+                    requested = {g.strip() for g in str(func.args.get("groups", "")).split(",") if g.strip() in TOOL_GROUPS}
+                    newly = requested - active_groups
+                    active_groups |= requested
+                    if newly:
+                        needs_rebuild = True
+                        result = f"Loaded tool groups: {', '.join(sorted(newly))}. Those tools are now available - use them."
+                    elif requested:
+                        result = "Those tool groups are already loaded and available."
+                    else:
+                        result = f"No known tool groups in '{func.args.get('groups', '')}'. Valid groups: {', '.join(TOOL_GROUPS)}."
+                tool_entries.append(f"load_tools({func.args.get('groups', '')}) → {result[:80]}")
+                parts.extend(_tool_result_parts(func, tool_name, result))
+                continue
             else:
                 seen_calls.add(call_key)
                 if confirm_callback and tool_name in RISKY_TOOLS and not BYPASS_CONFIRM:
@@ -643,6 +676,11 @@ async def _run_tool_loop(chat: Any, response: Any, persist_mode: bool = False, s
                 result_text = result[1] if isinstance(result, tuple) else str(result)
                 tool_entries.append(f"{tool_name}({args_summary}) → {result_text[:200]}")
             parts.extend(_tool_result_parts(func, tool_name, result))
+        if needs_rebuild and rebuild_chat is not None:
+            #Recreate the chat with the expanded tool set, carrying the history forward so the
+            #model's next turn can actually call the newly-loaded tools.
+            chat = rebuild_chat(chat.get_history(), active_groups)
+            logger.info("Tools expanded mid-task -> now: %s", ",".join(sorted(active_groups)))
         response = await chat.send_message(parts)
         _prune_old_screenshots(chat)
         _prune_old_tool_results(chat)
@@ -669,12 +707,12 @@ def _finalize_reply(response: Any, give_up: bool) -> str:
 
 def _prep_context(prompt: str, enable_recall: bool, recent_texts: set, limit_tools: bool) -> tuple[list, Any]:
     """Blocking work done in one worker-thread hop: embed the message ONCE, then reuse that
-    vector for both semantic recall (older relevant context) and dynamic tool selection. Returns
-    (recalled_results, selected_tool_object). Falls back to all tools if selection is off."""
+    vector for both semantic recall (older relevant context) and dynamic tool-group selection.
+    Returns (recalled_results, selected_group_names_or_None). None means 'all tools'."""
     vector = embeddings.embed_text(prompt) if (enable_recall or limit_tools) and prompt else None
     recalled = embeddings.recall_with_vector(vector, RECALL_K, recent_texts) if enable_recall else []
-    selected = _select_tools(vector) if limit_tools else tools
-    return recalled, selected
+    groups = _select_groups(vector) if limit_tools else None
+    return recalled, groups
 
 async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool = False, status_callback: Any = None, confirm_callback: Any = None, media_parts: list | None = None, enable_recall: bool = False, limit_tools: bool = False) -> tuple[str, bool, list[str]]:
     """Builds a chat from the stored conversation history, sends `prompt` to the model, runs the
@@ -692,22 +730,29 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
         contents=[types.Content(role=msg["role"], parts=[types.Part(text=msg["parts"][0])]) for msg in conversation] #Converts the conversation history into the correct format for Gemini API
         #Embed the message once (off the event loop) and reuse it for recall + tool selection
         recent_texts = {msg["parts"][0] for msg in conversation} if enable_recall else set()
-        recall_results, active_tools = await asyncio.to_thread(_prep_context, prompt, enable_recall, recent_texts, limit_tools)
+        recall_results, active_groups = await asyncio.to_thread(_prep_context, prompt, enable_recall, recent_texts, limit_tools)
         recalled = "\n".join(f"- ({r['source']}) {r['text']}" for r in recall_results)
         browser_url = t.browser_current_url() #Grounds the model in the browser's actual current page, regardless of what past conversation text says
         now = datetime.now().astimezone().isoformat() #Grounds the model in the current date/time for resolving relative dates (e.g. calendar events)
         logs = database.get_tool_logs(conversation_id)
         tool_log = "\n".join(f"- {entry}" for entry in logs)
-        chat = client.aio.chats.create( #The async client - same API, but send_message can be awaited so it doesn't block the event loop
-                model=GEMINI_MODEL,
-                history=contents, #type: ignore
-                config=types.GenerateContentConfig(tools=[active_tools],
-                    system_instruction=build_system_instruction(memory, browser_url, now, persist_mode, tool_log, recalled)
-            ),)
+        system_instruction = build_system_instruction(memory, browser_url, now, persist_mode, tool_log, recalled)
+        if limit_tools:
+            selected = "all" if active_groups is None else ",".join(sorted(active_groups))
+            n = len(tool_dict) if active_groups is None else len(_tool_object_for_groups(active_groups).function_declarations)
+            logger.info("Tool selection: groups=[%s] -> %d/%d tools", selected, n, len(tool_dict))
+        #Rebuilds the chat with a (possibly expanded) tool set while preserving history - used to
+        #create the initial chat and again when load_tools pulls in more groups mid-task.
+        def rebuild_chat(history: Any, groups: set | None) -> Any:
+            return client.aio.chats.create(
+                model=GEMINI_MODEL, history=history, #type: ignore
+                config=types.GenerateContentConfig(tools=[_tool_object_for_groups(groups)], system_instruction=system_instruction),
+            )
+        chat = rebuild_chat(contents, active_groups)
         #With media attached, the message is a list of Parts (media first, then the text)
         message = media_parts + [types.Part(text=prompt)] if media_parts else prompt
         response = await chat.send_message(message)
-        response, give_up, tool_entries = await _run_tool_loop(chat, response, persist_mode, status_callback, conversation_id, confirm_callback, chat_id) #Executes any tool calls the model requested
+        response, give_up, tool_entries = await _run_tool_loop(chat, response, persist_mode, status_callback, conversation_id, confirm_callback, chat_id, rebuild_chat, active_groups) #Executes any tool calls the model requested
         return _finalize_reply(response, give_up), give_up, tool_entries
     finally:
         _active_generations.discard(chat_id)

@@ -272,6 +272,21 @@ def stop_process(process_id: int) -> str:
     except Exception as e:
         return f"Error stopping process {process_id}: {e}"
 
+def load_tools(groups: str) -> str:
+    """Loads additional tool groups when a task needs a capability you don't currently have.
+    Your tools are limited per message to the ones relevant to the request; if partway through
+    a task you need others (e.g. you're filling out a form in the browser but now need to send
+    an email), call this FIRST to load them, then use them. Available groups:
+      - browser: open websites, read/click/type on pages, fill and submit forms, apply online
+      - google: Gmail (read/search/send), Google Calendar, Google Drive, Google Sheets
+      - files: list/read/write/find/move local files, download files, fetch web page contents
+      - processes: run shell commands, start/stop servers, read their output, schedule tasks
+
+    Args:
+        groups: Comma-separated group names to load, e.g. "google" or "files,processes".
+    """
+    return f"Requested tool groups: {groups}"
+
 def save_memory(key: str, value: str) -> str:
     """Saves a key-value pair to the bot's memory. Use this to remember important
     information about the user, such as their name, preferences, goals, or facts
