@@ -58,3 +58,22 @@ def remember(source: str, text: str, ref: str | None = None, replace: bool = Fal
 def forget(ref: str) -> None:
     """Removes any stored embedding with this external ref (e.g. a deleted memory fact)."""
     database.delete_embeddings_by_ref(ref)
+
+def recall(query: str, k: int = 5, exclude: set | None = None) -> list:
+    """Returns up to k stored texts semantically similar to `query`, nearest first, each a
+    {'source', 'text', 'distance'}. `exclude` is a set of texts to drop (e.g. messages already
+    in the recent history window) so recall surfaces things NOT already in context. Empty list
+    if vectors are unavailable or the query can't be embedded - never raises."""
+    if not database.VECTOR_ENABLED:
+        return []  #skip the embed API call entirely when there's nothing to search
+    query = (query or "").strip()
+    if not query:
+        return []
+    vector = embed_text(query)
+    if not vector:
+        return []
+    fetch = k + (len(exclude) if exclude else 0)  #over-fetch so exclusions still leave up to k
+    results = database.search_embeddings(vector, k=fetch)
+    if exclude:
+        results = [r for r in results if r["text"] not in exclude]
+    return results[:k]

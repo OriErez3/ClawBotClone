@@ -103,7 +103,7 @@ async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
     await update.message.reply_text("Hello! I'm your Google AI assistant.")
-def build_system_instruction(memory: str, browser_url: str, now: str, persist_mode: bool = False, tool_log: str = "") -> str:
+def build_system_instruction(memory: str, browser_url: str, now: str, persist_mode: bool = False, tool_log: str = "", recall: str = "") -> str:
     cwd = os.getcwd()
     #`cd /d` is cmd.exe-only (switches drive too); POSIX shells just use `cd`
     cd_example = "cd /d <folder> &&" if os_name == "Windows" else "cd <folder> &&"
@@ -153,6 +153,10 @@ Tool rules:
         instruction += "\n- PERSISTENT MODE IS ON: do not give up, ask the user for help, or stop early. Keep trying different approaches until the task is fully complete. Only stop if you hit an unrecoverable API error."
     if tool_log:
         instruction += f"\n\nRecent tool calls in this conversation:\n{tool_log}"
+    if recall:
+        instruction += ("\n\nRelevant things you recall (retrieved by similarity to the user's current "
+                        "message - may be older conversation from beyond the recent history, saved facts, "
+                        f"or emails; use if relevant, ignore if not):\n{recall}")
     return instruction
 #Function to handle messages. Used the most often.
 
@@ -548,11 +552,12 @@ def _finalize_reply(response: Any, give_up: bool) -> str:
         return "Sorry, I couldn't come up with a response there. Could you try rephrasing?"
     return final_text
 
-async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool = False, status_callback: Any = None, confirm_callback: Any = None, media_parts: list | None = None) -> tuple[str, bool, list[str]]:
+async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool = False, status_callback: Any = None, confirm_callback: Any = None, media_parts: list | None = None, enable_recall: bool = False) -> tuple[str, bool, list[str]]:
     """Builds a chat from the stored conversation history, sends `prompt` to the model, runs the
     tool loop, and returns (final_text, give_up). Does not touch the conversation history table -
     callers decide what (if anything) to record. media_parts optionally attaches images/audio
-    (as types.Part) ahead of the prompt text, for photo/voice messages."""
+    (as types.Part) ahead of the prompt text, for photo/voice messages. enable_recall pulls in
+    semantically-related older context (only for real user messages, not the timer jobs)."""
     _active_generations.add(chat_id)
     _cancel_requests.discard(chat_id) #a stale /cancel from an earlier task must not kill this one
     try:
@@ -560,6 +565,14 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
         conversation_id = database.get_active_conversation_id()
         conversation = read_conversation(30, conversation_id) #Reads the recent conversation history to provide context for the AI's response
         contents=[types.Content(role=msg["role"], parts=[types.Part(text=msg["parts"][0])]) for msg in conversation] #Converts the conversation history into the correct format for Gemini API
+        recalled = ""
+        if enable_recall:
+            #Semantic recall of older context. Exclude what's already in the recent-30 window so
+            #it only surfaces things NOT already in the prompt. Embedding is a network call -
+            #run it off the event loop.
+            recent_texts = {msg["parts"][0] for msg in conversation}
+            results = await asyncio.to_thread(embeddings.recall, prompt, RECALL_K, recent_texts)
+            recalled = "\n".join(f"- ({r['source']}) {r['text']}" for r in results)
         browser_url = t.browser_current_url() #Grounds the model in the browser's actual current page, regardless of what past conversation text says
         now = datetime.now().astimezone().isoformat() #Grounds the model in the current date/time for resolving relative dates (e.g. calendar events)
         logs = database.get_tool_logs(conversation_id)
@@ -568,7 +581,7 @@ async def _generate_response(prompt: str, chat_id: int = 0, persist_mode: bool =
                 model=GEMINI_MODEL,
                 history=contents, #type: ignore
                 config=types.GenerateContentConfig(tools=[tools],
-                    system_instruction=build_system_instruction(memory, browser_url, now, persist_mode, tool_log)
+                    system_instruction=build_system_instruction(memory, browser_url, now, persist_mode, tool_log, recalled)
             ),)
         #With media attached, the message is a list of Parts (media first, then the text)
         message = media_parts + [types.Part(text=prompt)] if media_parts else prompt
@@ -596,6 +609,7 @@ def _chunk_message(text: str) -> list:
     oversized message raises BadRequest and the user would get nothing at all."""
     return [text[i:i + TELEGRAM_MAX_MESSAGE_CHARS] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_CHARS)] or [text]
 
+RECALL_K = 5  #how many semantically-similar past items to pull into the prompt per message
 #Holds references to fire-and-forget background tasks (embedding). Without a live reference
 #the event loop can garbage-collect a running task; the done-callback drops it when finished.
 _background_tasks: set = set()
@@ -637,7 +651,7 @@ async def _handle_user_request(update: telegram.Update, context: ContextTypes.DE
                 database.set_setting("chat_id", chat_id)
             conversation_id = database.get_active_conversation_id()
             add_to_conversation("user", history_text, conversation_id) #Saves the user's message to the conversation history in the database
-            final_text, _, tool_entries = await _generate_response(user_message, chat_id=int_chat_id, persist_mode=PERSIST_MODE, status_callback=status.update, confirm_callback=confirm, media_parts=media_parts)
+            final_text, _, tool_entries = await _generate_response(user_message, chat_id=int_chat_id, persist_mode=PERSIST_MODE, status_callback=status.update, confirm_callback=confirm, media_parts=media_parts, enable_recall=True)
             add_to_conversation("model", final_text, conversation_id, tool_log="\n".join(tool_entries)) #Saves the AI's response to the conversation history in the database
             for chunk in _chunk_message(final_text): #Sends the AI's response back to the user on Telegram
                 await update.message.reply_text(chunk)
