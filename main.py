@@ -9,6 +9,7 @@ from database import add_to_conversation, read_conversation, read_memory
 import tools as t
 import google_services as gs
 import database
+import embeddings
 import platform
 import inspect
 import subprocess
@@ -595,6 +596,19 @@ def _chunk_message(text: str) -> list:
     oversized message raises BadRequest and the user would get nothing at all."""
     return [text[i:i + TELEGRAM_MAX_MESSAGE_CHARS] for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_CHARS)] or [text]
 
+#Holds references to fire-and-forget background tasks (embedding). Without a live reference
+#the event loop can garbage-collect a running task; the done-callback drops it when finished.
+_background_tasks: set = set()
+
+def _embed_in_background(source: str, text: str) -> None:
+    """Embeds `text` for semantic recall without blocking the reply path - the network embed
+    call runs in a worker thread, fire-and-forget (remember() swallows its own errors)."""
+    if not text or not text.strip():
+        return
+    task = asyncio.create_task(asyncio.to_thread(embeddings.remember, source, text))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 async def _handle_user_request(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE, user_message: str, history_text: str, media_parts: list | None = None) -> None:
     """Shared pipeline for every kind of user message (text, photo, voice): queue on the
     per-chat lock, show status, run the generation, record history, and send the reply.
@@ -627,6 +641,9 @@ async def _handle_user_request(update: telegram.Update, context: ContextTypes.DE
             add_to_conversation("model", final_text, conversation_id, tool_log="\n".join(tool_entries)) #Saves the AI's response to the conversation history in the database
             for chunk in _chunk_message(final_text): #Sends the AI's response back to the user on Telegram
                 await update.message.reply_text(chunk)
+            #Embed this turn (user + reply) for long-term semantic recall - off the reply path
+            _embed_in_background("message", history_text)
+            _embed_in_background("message", final_text)
         except Exception as e:
             logger.exception("Failed to handle message") #Keep a full traceback in the console, not just the Telegram reply
             await update.message.reply_text(_describe_error(e))

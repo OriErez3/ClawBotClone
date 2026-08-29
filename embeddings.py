@@ -9,6 +9,8 @@ import os
 
 from google import genai
 
+import database
+
 logger = logging.getLogger(__name__)
 
 #text-embedding-004 outputs 768-dim vectors and is cheap; keep in sync with database.EMBED_DIM
@@ -35,3 +37,24 @@ def embed_text(text: str) -> list | None:
     except Exception as e:
         logger.warning("Embedding failed: %s", e)
         return None
+
+def remember(source: str, text: str, ref: str | None = None, replace: bool = False) -> None:
+    """Embeds `text` and stores it for later semantic recall. `source` tags provenance
+    ('message' | 'memory' | 'email'). `ref` is an optional external id: with replace=True an
+    existing entry for that ref is overwritten first (a memory fact that changed); otherwise a
+    ref that already exists is skipped (dedup, e.g. an email seen before). Best-effort - does
+    nothing if the text is empty or embedding/the vector store is unavailable, never raises."""
+    text = (text or "").strip()
+    if not text:
+        return
+    if ref and replace:
+        database.delete_embeddings_by_ref(ref)
+    elif ref and database.embedding_ref_exists(ref):
+        return
+    vector = embed_text(text)
+    if vector:
+        database.add_embedding(source, text, vector, ref)
+
+def forget(ref: str) -> None:
+    """Removes any stored embedding with this external ref (e.g. a deleted memory fact)."""
+    database.delete_embeddings_by_ref(ref)

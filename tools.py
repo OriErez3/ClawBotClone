@@ -8,6 +8,7 @@ from database import add_to_memory
 from database import read_memory as read_memory_db
 from database import delete_memory as delete_memory_db
 from database import add_scheduled_task, get_setting
+import embeddings
 import os
 import shutil
 import time
@@ -281,6 +282,9 @@ def save_memory(key: str, value: str) -> str:
         value: The value to remember.
     """
     add_to_memory(key, value)
+    #Also embed the fact for semantic recall; replace any prior embedding for this key so an
+    #updated fact doesn't leave a stale copy behind. ref ties the embedding to the memory key.
+    embeddings.remember("memory", f"{key}: {value}", ref=f"memory:{key}", replace=True)
     return f"Memory saved: {key} = {value}"
 
 def delete_memory(key: str) -> str:
@@ -291,6 +295,7 @@ def delete_memory(key: str) -> str:
         key: The key of the memory to delete.
     """
     if delete_memory_db(key):
+        embeddings.forget(f"memory:{key}")  #drop its embedding too
         return f"Memory deleted: {key}"
     return f"Memory not found: {key}"
 

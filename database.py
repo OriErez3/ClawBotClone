@@ -119,6 +119,18 @@ def embedding_ref_exists(ref: str) -> bool:
         cursor.execute("SELECT 1 FROM embeddings WHERE ref = ?", (ref,))
         return cursor.fetchone() is not None
 
+def delete_embeddings_by_ref(ref: str) -> None:
+    """Removes any stored embedding(s) with this external ref - used to replace a memory fact
+    when it's updated, or forget it when deleted. No-op if vectors are disabled."""
+    if not VECTOR_ENABLED or not ref:
+        return
+    with _lock:
+        rows = cursor.execute("SELECT id FROM embeddings WHERE ref = ?", (ref,)).fetchall()
+        for (row_id,) in rows:
+            cursor.execute("DELETE FROM vec_embeddings WHERE rowid = ?", (row_id,))
+        cursor.execute("DELETE FROM embeddings WHERE ref = ?", (ref,))
+        conn.commit()
+
 def search_embeddings(embedding: list, k: int = 5, sources: list | None = None) -> list:
     """Returns up to k stored texts most similar to `embedding`, nearest first, as
     [{'source', 'text', 'distance'}]. `sources` optionally restricts which kinds to return.
