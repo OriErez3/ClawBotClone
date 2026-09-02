@@ -15,6 +15,7 @@ import inspect
 import subprocess
 import sys
 import base64
+import json
 import logging
 import re
 from datetime import datetime, time as dt_time, timedelta
@@ -60,6 +61,7 @@ tool_dict = {
     "save_skill": t.save_skill,
     "delete_skill": t.delete_skill,
     "read_schedule": t.read_schedule,
+    "log_leetcode_result": t.log_leetcode_result,
     "find_file": t.find_file,
     "move_file": t.move_file,
     "web_search": t.web_search,
@@ -112,6 +114,7 @@ CORE_TOOLS = {  #always available regardless of the task
     "save_memory", "delete_memory", "read_memory",
     "load_skill", "save_skill", "delete_skill", "web_search",
     "read_schedule",  #class-timetable lookups don't match any group description
+    "log_leetcode_result",  #the reply can arrive during any task, so it must always be loadable
 }
 TOOL_GROUPS = {
     "files": {
@@ -204,6 +207,35 @@ async def start(update: telegram.Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
     await update.message.reply_text("Hello! I'm your Google AI assistant.")
+def leetcode_pending_block() -> str:
+    """Renders the 'today's LeetCode isn't logged yet' block for the system prompt, or '' when
+    nothing is pending. Injected into EVERY message rather than fetched with a tool because the
+    user's report ("first one was fine, second I brute forced") can land hours after the 8am
+    briefing has dropped out of the RECENT_HISTORY_MESSAGES window - and unlike normal turns,
+    briefing text is never embedded, so semantic recall can't bring it back either."""
+    raw = database.get_setting("leetcode_pending")
+    if not raw:
+        return ""
+    try:
+        pending = json.loads(raw)
+    except ValueError:  #json.JSONDecodeError subclasses ValueError
+        logger.warning("Ignoring unparseable leetcode_pending: %r", raw[:80])
+        return ""
+    problems = pending.get("problems") or []
+    if not problems:
+        return ""
+    listed = "\n".join(f"  {i}. {p[0]} (topic: {p[1]})" if len(p) > 1 and p[1] else f"  {i}. {p[0]}"
+                       for i, p in enumerate(problems, start=1))
+    return (f"""
+
+Today's LeetCode problems ({pending.get('date', 'today')}), not yet logged:
+{listed}
+When the user says how one went, call log_leetcode_result for it - that writes their tracker
+spreadsheet and the history behind tomorrow's picks in one step, so don't use sheets_append for
+this. got_it must be 'yes', 'partly' or 'no'; put their own words in notes. Log each problem as
+they mention it; the assignment clears itself once they're all in. Don't raise these unprompted
+mid-conversation - just handle them when the user brings them up.""")
+
 def build_system_instruction(memory: str, browser_url: str, now: str, persist_mode: bool = False, tool_log: str = "", recall: str = "") -> str:
     cwd = os.getcwd()
     #`cd /d` is cmd.exe-only (switches drive too); POSIX shells just use `cd`
@@ -254,6 +286,7 @@ Tool rules:
         instruction += "\n- PERSISTENT MODE IS ON: do not give up, ask the user for help, or stop early. Keep trying different approaches until the task is fully complete. Only stop if you hit an unrecoverable API error."
     if tool_log:
         instruction += f"\n\nRecent tool calls in this conversation:\n{tool_log}"
+    instruction += leetcode_pending_block()
     if recall:
         instruction += ("\n\nRelevant things you recall (retrieved by similarity to the user's current "
                         "message - may be older conversation from beyond the recent history, saved facts, "
@@ -333,6 +366,7 @@ MORNING_BRIEFING_HOUR = 8
 MORNING_PROMPT = (
     "[Morning briefing] Good morning. Today is {today}. Tomorrow is {tomorrow}.\n\n"
     "{schedule_section}"
+    "{leetcode_section}"
     "Use calendar_list_events to look up the user's upcoming events, then give a short, friendly "
     "briefing of what's on for TODAY and TOMORROW only, under 'Today' and 'Tomorrow' headings. "
     "Under each heading merge that day's classes and calendar events into ONE list ordered by "
@@ -341,6 +375,15 @@ MORNING_PROMPT = (
     "anything that has already ended today. Keep it brief - a day with nothing on it just gets a "
     "line saying so. If there are genuinely no classes AND no events on either day, reply with "
     "exactly: NOTHING_TO_REPORT"
+)
+LEETCODE_PER_DAY = 2
+LEETCODE_NUDGE_HOUR = 20  #server-local, like MORNING_BRIEFING_HOUR
+MORNING_LEETCODE_SECTION = (
+    "Today's two LeetCode problems for the user - already chosen, do NOT substitute, reorder or "
+    "add to them:\n{problems}\n\nList them at the very end of the briefing under a 'LeetCode' "
+    "heading, with their topics, and say they can tell you how the problems went whenever "
+    "they're done and you'll log it to their tracker sheet. Because there are problems to hand "
+    "out, do NOT reply NOTHING_TO_REPORT today even if the two days are otherwise empty.\n\n"
 )
 MORNING_SCHEDULE_SECTION = (
     "The user's class schedule, which repeats every week. Use ONLY the entries for the two "
@@ -490,6 +533,7 @@ _TOOL_STATUS: dict[str, str] = {
     "read_memory":           "Reading memory...",
     "load_skill":            "Loading a skill...",
     "read_schedule":         "Checking your class schedule...",
+    "log_leetcode_result":   "Logging your LeetCode result...",
     "save_skill":            "Saving a skill...",
     "delete_skill":          "Deleting a skill...",
     "schedule_task":         "Scheduling a task...",
@@ -1114,17 +1158,103 @@ async def proactive_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Hourly: checks for noteworthy unread email and messages the user if something matters."""
     await _run_unprompted_check(context, CHECKIN_PROMPT, "Checking in...")
 
+LEETCODE_MIN_ATTEMPTS = 2  #a topic needs this many attempts before it counts as a weakness
+
+def _pick_leetcode(queue: list, done: set, stats: list) -> tuple:
+    """Chooses today's problems: one to keep moving through the queue, one to drill the weakest
+    topic. Returns (picked, weak_topic_or_None) where weak_topic is set only when the second
+    pick was actually steered by it - the briefing uses that to explain itself.
+
+    Both picks come from `queue` (the file), so a problem that doesn't exist can't be assigned,
+    and both skip `done`, so nothing repeats. `stats` is worst-topic-first."""
+    remaining = [p for p in queue if p[0] not in done]
+    if not remaining:
+        return [], None  #whole queue attempted - nothing left to hand out
+    first = remaining[0]  #queue order is the seed shuffle: "next unused"
+    rest = remaining[1:]
+    weak_topic = stats[0]["topic"] if stats else None
+    second = None
+    if weak_topic and first[1] == weak_topic:
+        #The steady pick already lands on the weak topic - steering the second one there too
+        #would make the whole day one subject, so deliberately vary it instead.
+        second = next((p for p in rest if p[1] != weak_topic), None)
+    elif weak_topic:
+        second = next((p for p in rest if p[1] == weak_topic), None)
+        if second is None:
+            weak_topic = None  #nothing unused left in it - don't claim we drilled it
+    if second is None:
+        second = rest[0] if rest else None
+    picked = [first] + ([second] if second is not None else [])
+    return picked[:LEETCODE_PER_DAY], weak_topic
+
+def _assign_leetcode() -> tuple:
+    """Picks the day's problems and records them as pending. Returns (picked, weak_topic) -
+    ([], None) when there's no queue file, which is what makes the whole feature opt-in.
+
+    Selection reads only the local leetcode_log, never the tracker sheet, so it isn't subject
+    to sheets_read's 100-row cap the way "pick two I haven't done yet" would be."""
+    queue = t.leetcode_queue()
+    if not queue:
+        return [], None
+    picked, weak_topic = _pick_leetcode(queue, database.leetcode_done_problems(),
+                                        database.leetcode_topic_stats(LEETCODE_MIN_ATTEMPTS))
+    if not picked:
+        return [], None
+    #Overwrites any assignment the user never reported on - a skipped day leaves no sheet row
+    database.set_setting("leetcode_pending", json.dumps({
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "problems": [list(p) for p in picked],
+    }))
+    return picked, weak_topic
+
+def _morning_data() -> tuple:
+    """The briefing's blocking work (file reads + the pending write) in one worker-thread hop."""
+    picked, weak_topic = _assign_leetcode()
+    return t.schedule_text(), picked, weak_topic
+
+async def leetcode_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Evening: if the day's problems still aren't logged, ask how they went. Deliberately NOT a
+    model call - there's nothing to reason about, so a templated message costs nothing per day,
+    and the user's reply runs the normal path where leetcode_pending_block tells the model what
+    to log. Silent when nothing is pending."""
+    chat_id = database.get_setting("chat_id")
+    raw = database.get_setting("leetcode_pending")
+    if not chat_id or not raw:
+        return
+    try:
+        problems = json.loads(raw).get("problems") or []
+    except ValueError:
+        return
+    if not problems:
+        return
+    listed = "\n".join(f"- {p[0]}" for p in problems)
+    text = (f"How did today's LeetCode go?\n{listed}\n\n"
+            "Tell me how each one went plus any notes and I'll add them to your tracker.")
+    try:
+        await context.bot.send_message(chat_id=int(chat_id), text=text)
+    except Exception:
+        logger.exception("LeetCode nudge failed to send")
+        return
+    add_to_conversation("model", text, database.get_active_conversation_id())
+
 async def morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Once daily: today's and tomorrow's classes (from the user's schedule file) merged with
-    their calendar events. Names both weekdays explicitly so picking the right rows out of a
+    their calendar events, plus the day's two LeetCode problems. Names both weekdays explicitly so picking the right rows out of a
     weekly schedule isn't left to the model's own date arithmetic."""
     now = datetime.now().astimezone()
-    schedule = t.schedule_text()
-    #str.format doesn't re-scan substituted values, so stray braces in the schedule file are safe
+    schedule, picked, weak_topic = await asyncio.to_thread(_morning_data)
+    problems = "\n".join(f"  - {name} (topic: {topic})" if topic else f"  - {name}"
+                         for name, topic in picked)
+    if weak_topic:
+        problems += (f"\n(One of these is a {weak_topic} problem - the topic they've been getting "
+                     "wrong most often. Mention that in one short clause so they know why it was "
+                     "picked.)")
+    #str.format doesn't re-scan substituted values, so stray braces in the data files are safe
     prompt = MORNING_PROMPT.format(
         today=now.strftime("%A, %B %d"),
         tomorrow=(now + timedelta(days=1)).strftime("%A, %B %d"),
         schedule_section=MORNING_SCHEDULE_SECTION.format(schedule=schedule) if schedule else "",
+        leetcode_section=MORNING_LEETCODE_SECTION.format(problems=problems) if picked else "",
     )
     #Full tool set: the injected schedule text would skew the group-selection embedding away
     #from the google group this briefing needs, and it's one call a day - not worth the risk.
@@ -1213,6 +1343,10 @@ def main() -> None:
     application.job_queue.run_daily( #type: ignore
         morning_briefing,
         time=dt_time(hour=MORNING_BRIEFING_HOUR, minute=0),  #server-local time (set the box's tz)
+    )
+    application.job_queue.run_daily( #type: ignore
+        leetcode_nudge,
+        time=dt_time(hour=LEETCODE_NUDGE_HOUR, minute=0),
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, respond))
     application.add_handler(MessageHandler(filters.PHOTO & user_filter, respond_photo))

@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import subprocess
@@ -7,8 +8,10 @@ from datetime import datetime
 from database import add_to_memory
 from database import read_memory as read_memory_db
 from database import delete_memory as delete_memory_db
-from database import add_scheduled_task, get_setting
+from database import add_scheduled_task, get_setting, set_setting
+import database
 import embeddings
+import google_services as gs
 import os
 import shutil
 import time
@@ -446,6 +449,83 @@ def read_schedule() -> str:
                 "to write it there with write_file.")
     return f"{text}\n\n(Schedule file: {SCHEDULE_FILE})"
 
+# LeetCode practice queue: one "Problem Name | Topic" per line, in the order they get handed
+# out. The order is shuffled ONCE when the file is seeded (see leetcode.example.txt) rather
+# than at pick time - walking a pre-shuffled list keeps selection O(1) and guarantees no
+# repeats, where reshuffling every morning would need the whole solved-log to avoid them.
+# Gitignored like schedule.txt: it's personal progress, not repo content.
+LEETCODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leetcode.txt")
+
+def leetcode_queue() -> list:
+    """Returns the practice queue as [(name, topic)], or [] if there's no file, it's empty, or
+    it can't be read. Topic is '' on a line with no '|'. Not a model tool - the morning briefing
+    walks this list itself so the model never picks (and so never repeats or invents) problems."""
+    try:
+        with open(LEETCODE_FILE, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+    except OSError:
+        return []
+    queue = []
+    for line in lines:
+        name, _, topic = line.partition("|")
+        if name.strip():
+            queue.append((name.strip(), topic.strip()))
+    return queue
+
+_SHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9_-]+)")
+
+def _leetcode_sheet_id() -> str:
+    """The tracker spreadsheet's id, read from the memory fact the model saves under
+    'leetcode_sheet_id'. Accepts a full sheet URL stored there (that's what a user pastes)
+    and pulls the id out of it. '' when nothing is saved yet."""
+    raw = (database.get_memory("leetcode_sheet_id") or "").strip()
+    match = _SHEET_ID_RE.search(raw)
+    return match.group(1) if match else raw
+
+def log_leetcode_result(problem: str, got_it: str, notes: str = "") -> str:
+    """Records how ONE of today's assigned LeetCode problems went. Call this once per problem
+    as soon as the user tells you how it went - it writes the row to their tracker spreadsheet
+    AND updates the local history the morning picks are based on, so don't also call
+    sheets_append for it. When every assigned problem is logged, today's assignment clears
+    itself and the evening reminder goes quiet.
+
+    Args:
+        problem: The problem's name, exactly as it was assigned this morning.
+        got_it: Exactly one of 'yes' (solved it), 'partly' (got there with hints or too slowly), or 'no' (couldn't).
+        notes: The user's own comment in their words - what tripped them up, what they'd revisit. Empty if they didn't say.
+    """
+    got_it = (got_it or "").strip().lower()
+    if got_it not in database.GOT_IT_SCORES:
+        return f"Error: got_it must be exactly one of {', '.join(database.GOT_IT_SCORES)}."
+    raw = get_setting("leetcode_pending")
+    try:
+        problems = (json.loads(raw) if raw else {}).get("problems") or []
+    except ValueError:
+        problems = []
+    if not problems:
+        return "There's no LeetCode assignment outstanding right now - nothing to log."
+    match = next((p for p in problems if p[0].strip().lower() == problem.strip().lower()), None)
+    if match is None:
+        names = ", ".join(p[0] for p in problems)
+        return f"'{problem}' isn't one of today's problems. Outstanding: {names}."
+    topic = match[1] if len(match) > 1 else ""
+    sheet_id = _leetcode_sheet_id()
+    if not sheet_id:
+        return ("No tracker spreadsheet is saved yet. Ask the user for the link to their LeetCode "
+                "sheet, save it with save_memory under the key 'leetcode_sheet_id', then call this again.")
+    #Sheet first: if the user-visible record fails to write, log nothing locally, so the two
+    #never drift apart and the problem stays outstanding for a retry.
+    appended = gs.sheets_append(sheet_id, json.dumps([[match[0], topic, got_it, notes]]))
+    if appended.startswith("Error"):
+        return f"Nothing was logged - writing to the spreadsheet failed: {appended}"
+    database.add_leetcode_attempt(match[0], topic, got_it, notes)
+    remaining = [p for p in problems if p is not match]
+    if remaining:
+        set_setting("leetcode_pending", json.dumps({"date": datetime.now().strftime("%Y-%m-%d"),
+                                                    "problems": remaining}))
+        return f"Logged '{match[0]}' ({got_it}). Still outstanding: {', '.join(p[0] for p in remaining)}."
+    set_setting("leetcode_pending", "")
+    return f"Logged '{match[0]}' ({got_it}). That's both of today's problems done - assignment cleared."
 
 def schedule_task(when: str, task: str) -> str:
     """Schedules a task to be executed automatically at a specific future time, using the

@@ -1,0 +1,135 @@
+# LeetCode practice queue - the bot hands out the next two lines each morning.
+# Format: Problem Name | Topic   (both columns go straight into the tracker sheet)
+#
+# The order is ALREADY SHUFFLED. It's walked top-to-bottom via a pointer, so you never get a
+# repeat; shuffling once at seed time is what makes that guarantee possible. To reshuffle,
+# regenerate this file and reset the pointer (ask the bot to reset your leetcode index).
+#
+# Weighted away from the NeetCode 150 since you've done those. Delete any line you don't want,
+# or paste in your own list - only the "Name | Topic" shape matters.
+
+Minimum Height Trees | Graphs
+Minimum Path Sum | Dynamic Programming
+Best Time to Buy and Sell Stock IV | Dynamic Programming
+Binary Tree Inorder Traversal | Trees
+Remove Duplicates from Sorted Array | Arrays
+Sort Colors | Sorting
+Palindrome Number | Math
+Sum Root to Leaf Numbers | Trees
+Text Justification | Strings
+Summary Ranges | Arrays
+Delete and Earn | Dynamic Programming
+Zigzag Conversion | Strings
+Factorial Trailing Zeroes | Math
+Roman to Integer | Strings
+Plus One | Arrays
+Ones and Zeroes | Dynamic Programming
+Split Array Largest Sum | Binary Search
+N-Queens II | Backtracking
+Contains Duplicate II | Arrays
+Capacity To Ship Packages Within D Days | Binary Search
+String to Integer (atoi) | Strings
+Ransom Note | Strings
+Sudoku Solver | Backtracking
+Find if Path Exists in Graph | Graphs
+Russian Doll Envelopes | Dynamic Programming
+Find Pivot Index | Prefix Sum
+Reverse String | Two Pointers
+Redundant Connection | Union Find
+Longest Common Prefix | Strings
+Maximum Average Subarray I | Sliding Window
+Network Delay Time | Graphs
+Boats to Save People | Two Pointers
+Ugly Number II | Heap
+All Paths From Source to Target | Graphs
+Evaluate Division | Graphs
+Peak Index in a Mountain Array | Binary Search
+Subarray Sum Equals K | Prefix Sum
+Partition List | Linked List
+Single Number II | Bit Manipulation
+Find Smallest Letter Greater Than Target | Binary Search
+Next Greater Element II | Monotonic Stack
+Remove Element | Two Pointers
+Is Graph Bipartite? | Graphs
+Intersection of Two Linked Lists | Linked List
+Length of Last Word | Strings
+Word Pattern | Strings
+Range Sum Query - Immutable | Prefix Sum
+Set Matrix Zeroes | Matrix
+Isomorphic Strings | Strings
+Sliding Window Median | Heap
+Best Time to Buy and Sell Stock III | Dynamic Programming
+Basic Calculator II | Stack
+Asteroid Collision | Stack
+Sqrt(x) | Binary Search
+Bitwise AND of Numbers Range | Bit Manipulation
+Valid Palindrome II | Two Pointers
+Distinct Subsequences | Dynamic Programming
+Decode String | Stack
+Convert Sorted Array to Binary Search Tree | Trees
+Move Zeroes | Arrays
+Rotate Array | Arrays
+Top K Frequent Words | Heap
+Integer to Roman | Strings
+Multiply Strings | Math
+Count Complete Tree Nodes | Trees
+Insert Interval | Intervals
+Squares of a Sorted Array | Two Pointers
+Swap Nodes in Pairs | Linked List
+Minimum Number of Arrows to Burst Balloons | Intervals
+Reverse Words in a String | Strings
+First Bad Version | Binary Search
+Binary Tree Postorder Traversal | Trees
+Palindrome Linked List | Linked List
+Remove Linked List Elements | Linked List
+Path Sum II | Trees
+Interleaving String | Dynamic Programming
+Flatten Binary Tree to Linked List | Trees
+Happy Number | Math
+Game of Life | Matrix
+Permutations II | Backtracking
+Combinations | Backtracking
+Maximal Square | Dynamic Programming
+Wildcard Matching | Dynamic Programming
+Balanced Binary Tree | Trees
+Candy | Greedy
+Insert Delete GetRandom O(1) | Design
+Reorganize String | Heap
+Simplify Path | Stack
+Lowest Common Ancestor of a Binary Tree | Trees
+Restore IP Addresses | Backtracking
+Spiral Matrix II | Matrix
+Maximum Length of Pair Chain | Dynamic Programming
+Majority Element | Arrays
+Keys and Rooms | Graphs
+Longest Palindromic Subsequence | Dynamic Programming
+Perfect Squares | Dynamic Programming
+Excel Sheet Column Number | Math
+Search Insert Position | Binary Search
+Integer Break | Dynamic Programming
+Binary Tree Zigzag Level Order Traversal | Trees
+Binary Tree Paths | Trees
+Delete Node in a BST | Trees
+Unique Paths II | Dynamic Programming
+Middle of the Linked List | Linked List
+Path Sum | Trees
+Minimum Depth of Binary Tree | Trees
+H-Index | Sorting
+Odd Even Linked List | Linked List
+Symmetric Tree | Trees
+Populating Next Right Pointers in Each Node | Trees
+Add Binary | Bit Manipulation
+Continuous Subarray Sum | Prefix Sum
+Basic Calculator | Stack
+Sort List | Linked List
+Triangle | Dynamic Programming
+Rotate List | Linked List
+Insertion Sort List | Linked List
+Accounts Merge | Union Find
+Target Sum | Dynamic Programming
+Queue Reconstruction by Height | Greedy
+Cheapest Flights Within K Stops | Graphs
+Power of Two | Bit Manipulation
+Merge Sorted Array | Arrays
+Number of Provinces | Graphs
+Remove All Adjacent Duplicates In String | Stack

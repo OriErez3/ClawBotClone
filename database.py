@@ -77,6 +77,20 @@ try:
 except sqlite3.OperationalError:
     pass  #column already exists
 cursor.execute("INSERT OR IGNORE INTO conversations (id, title) VALUES (1, 'Conversation 1')")
+#Local mirror of the LeetCode tracker sheet. The sheet stays the user-facing record; this table
+#is what the bot actually reasons over - which problems are used up (so the morning pick never
+#repeats) and which topics are going badly (so it can drill them). Keeping it local means
+#selection never reads the sheet, and so is never subject to sheets_read's 100-row cap.
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS leetcode_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        problem TEXT,
+        topic TEXT,
+        got_it TEXT,
+        notes TEXT,
+        logged REAL DEFAULT (unixepoch())
+    )
+''')
 conn.commit()
 
 #Vector store: one metadata table holding the raw text + provenance, and a parallel sqlite-vec
@@ -189,6 +203,48 @@ def read_memory():
     if not rows:
         return ''
     return "\n".join(f"{row[0]}: {row[1]}" for row in rows)
+
+#'yes' | 'partly' | 'no' -> a score, so a topic's difficulty is one average instead of parsed
+#free text. The tool that writes the log constrains got_it to these three values.
+GOT_IT_SCORES = {"yes": 1.0, "partly": 0.5, "no": 0.0}
+
+def add_leetcode_attempt(problem: str, topic: str, got_it: str, notes: str = "") -> None:
+    """Records one attempt. Called after the row is appended to the user's sheet, so the local
+    table and the sheet stay in step."""
+    with _lock:
+        cursor.execute(
+            "INSERT INTO leetcode_log (problem, topic, got_it, notes) VALUES (?, ?, ?, ?)",
+            (problem, topic, got_it, notes),
+        )
+        conn.commit()
+
+def leetcode_done_problems() -> set:
+    """Every problem name already attempted - the morning pick skips these, which is what
+    replaces the old sequential pointer once selection is allowed to jump between topics."""
+    with _lock:
+        rows = cursor.execute("SELECT DISTINCT problem FROM leetcode_log").fetchall()
+    return {r[0] for r in rows}
+
+def leetcode_topic_stats(min_attempts: int = 2) -> list:
+    """Per-topic difficulty, hardest first: [{'topic', 'attempts', 'score'}] where score is the
+    mean of GOT_IT_SCORES (0 = never got one, 1 = got them all). Topics with fewer than
+    `min_attempts` are excluded so a single bad day can't brand a whole topic as a weakness."""
+    case = " ".join(f"WHEN '{k}' THEN {v}" for k, v in GOT_IT_SCORES.items())
+    with _lock:
+        rows = cursor.execute(
+            f"SELECT topic, COUNT(*), AVG(CASE got_it {case} ELSE 0 END) FROM leetcode_log "
+            "WHERE topic != '' GROUP BY topic HAVING COUNT(*) >= ? ORDER BY 3 ASC, 2 DESC",
+            (min_attempts,),
+        ).fetchall()
+    return [{"topic": r[0], "attempts": r[1], "score": r[2]} for r in rows]
+
+def get_memory(key: str) -> str | None:
+    """Reads a single memory fact by key (read_memory returns them all as one blob). Lets code
+    look up something the model saved with save_memory - e.g. the tracker spreadsheet's id."""
+    with _lock:
+        cursor.execute("SELECT value FROM memory WHERE key = ?", (key,))
+        row = cursor.fetchone()
+    return row[0] if row else None
 
 def set_setting(key: str, value: str):
     with _lock:
