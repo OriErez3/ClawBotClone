@@ -1,0 +1,26 @@
+# Your weekly class schedule. Copy this file to schedule.txt (same folder) and put your
+# real classes in it - schedule.txt is gitignored, so your timetable stays off GitHub.
+#
+# The layout below is only a suggestion. The bot reads this file as plain text and hands
+# it to the model, so anything a person could follow works - as long as each class shows
+# its day, its time, and its room. Lines starting with # are ignored by you and by it.
+#
+# Used in two places: the 8am briefing lists today's and tomorrow's classes alongside your
+# calendar events, and you can ask about it any time ("what room is my next class in?").
+
+Monday
+  09:00-10:30   Linear Algebra          Room 302, Maths Building
+  11:00-12:30   Intro to Psychology     Room 118, Hall B
+
+Tuesday
+  13:00-15:00   Organic Chemistry Lab   Lab 4, Science Wing
+
+Wednesday
+  09:00-10:30   Linear Algebra          Room 302, Maths Building
+  14:00-15:30   Statistics              Room 210
+
+Thursday
+  11:00-12:30   Intro to Psychology     Room 118, Hall B
+
+Friday
+  no classes

@@ -17,7 +17,7 @@ import sys
 import base64
 import logging
 import re
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from typing import Any
 load_dotenv()
 logging.basicConfig(
@@ -59,6 +59,7 @@ tool_dict = {
     "load_skill": t.load_skill,
     "save_skill": t.save_skill,
     "delete_skill": t.delete_skill,
+    "read_schedule": t.read_schedule,
     "find_file": t.find_file,
     "move_file": t.move_file,
     "web_search": t.web_search,
@@ -110,6 +111,7 @@ CORE_TOOLS = {  #always available regardless of the task
     "load_tools",  #lets the model pull in more groups mid-task when it needs a capability it lacks
     "save_memory", "delete_memory", "read_memory",
     "load_skill", "save_skill", "delete_skill", "web_search",
+    "read_schedule",  #class-timetable lookups don't match any group description
 }
 TOOL_GROUPS = {
     "files": {
@@ -323,14 +325,27 @@ CHECKIN_PROMPT = (
 #about an event once (in the morning) instead of every hour. Runs at MORNING_BRIEFING_HOUR
 #in the server's local timezone.
 MORNING_BRIEFING_HOUR = 8
+#Built fresh at fire time (see morning_briefing) so the two weekday names and the user's class
+#schedule are baked straight in. The schedule is injected rather than fetched via read_schedule:
+#the briefing ALWAYS needs it, so spending a tool call - and risking the model skipping it - buys
+#nothing. {schedule_section} is empty when there's no schedule file, which degrades the briefing
+#to calendar events only (exactly what it did before).
 MORNING_PROMPT = (
-    "[Morning briefing] Good morning. Use calendar_list_events to look up the user's upcoming "
-    "events, then give a short, friendly summary of what's on for TODAY and TOMORROW only - "
-    "times and titles, soonest first, grouped under 'Today' and 'Tomorrow' headings. Use the "
-    "current date/time in your system info to decide which events fall on those two days and to "
-    "skip any that have already ended. Keep it brief - no events for a day means just say so for "
-    "that day. If there are genuinely no events on either today or tomorrow, reply with exactly: "
-    "NOTHING_TO_REPORT"
+    "[Morning briefing] Good morning. Today is {today}. Tomorrow is {tomorrow}.\n\n"
+    "{schedule_section}"
+    "Use calendar_list_events to look up the user's upcoming events, then give a short, friendly "
+    "briefing of what's on for TODAY and TOMORROW only, under 'Today' and 'Tomorrow' headings. "
+    "Under each heading merge that day's classes and calendar events into ONE list ordered by "
+    "time, soonest first. Give every class its start time, name and room, e.g. "
+    "\"09:00 - Linear Algebra (Room 302)\". Use the current date/time in your system info to skip "
+    "anything that has already ended today. Keep it brief - a day with nothing on it just gets a "
+    "line saying so. If there are genuinely no classes AND no events on either day, reply with "
+    "exactly: NOTHING_TO_REPORT"
+)
+MORNING_SCHEDULE_SECTION = (
+    "The user's class schedule, which repeats every week. Use ONLY the entries for the two "
+    "weekdays named above and ignore the rest; treat those classes as fixed commitments "
+    "alongside the calendar events:\n{schedule}\n\n"
 )
 SCHEDULED_TASK_PROMPT = (
     "[Scheduled task] The user previously asked you to do the following at this exact time. "
@@ -474,6 +489,7 @@ _TOOL_STATUS: dict[str, str] = {
     "save_memory":           "Saving to memory...",
     "read_memory":           "Reading memory...",
     "load_skill":            "Loading a skill...",
+    "read_schedule":         "Checking your class schedule...",
     "save_skill":            "Saving a skill...",
     "delete_skill":          "Deleting a skill...",
     "schedule_task":         "Scheduling a task...",
@@ -1055,12 +1071,15 @@ async def rename_conversation_cmd(update: telegram.Update, context: ContextTypes
     database.rename_conversation(active_id, name)
     await update.message.reply_text(f"Renamed Conversation {active_id} to '{name}'.")
 
-async def _run_unprompted_check(context: ContextTypes.DEFAULT_TYPE, prompt: str, status_text: str, skip_if_busy: bool = True) -> None:
+async def _run_unprompted_check(context: ContextTypes.DEFAULT_TYPE, prompt: str, status_text: str, skip_if_busy: bool = True, limit_tools: bool = True) -> None:
     """Shared machinery for the timer-driven jobs (hourly email check-in, morning briefing):
     take the per-chat lock, run a generation on `prompt`, and message the user unless the
     model replies NOTHING_TO_REPORT. skip_if_busy=True bails when the user has a task in flight
     (fine for the hourly check - another runs soon); False waits for the lock instead, so a
-    once-a-day briefing isn't lost just because a task happened to be running when it fired."""
+    once-a-day briefing isn't lost just because a task happened to be running when it fired.
+    limit_tools=False offers the full tool set instead of the groups matching the prompt - for a
+    prompt carrying a big chunk of injected text (the morning briefing's schedule), which would
+    otherwise dilute the embedding that picks those groups."""
     chat_id = database.get_setting("chat_id")
     if not chat_id:
         return
@@ -1077,7 +1096,7 @@ async def _run_unprompted_check(context: ContextTypes.DEFAULT_TYPE, prompt: str,
         typing_task = asyncio.create_task(_keep_typing(context.bot, int_chat_id, stop_typing))
         confirm = _make_confirm_callback(context.bot, int_chat_id, status)
         try:
-            final_text, give_up, tool_entries = await _generate_response(prompt, chat_id=int_chat_id, confirm_callback=confirm, limit_tools=True)
+            final_text, give_up, tool_entries = await _generate_response(prompt, chat_id=int_chat_id, confirm_callback=confirm, limit_tools=limit_tools)
         except Exception:
             logger.exception("Unprompted check failed")
             return
@@ -1096,8 +1115,20 @@ async def proactive_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_unprompted_check(context, CHECKIN_PROMPT, "Checking in...")
 
 async def morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Once daily: summarizes today's and tomorrow's calendar events."""
-    await _run_unprompted_check(context, MORNING_PROMPT, "Preparing your morning briefing...", skip_if_busy=False)
+    """Once daily: today's and tomorrow's classes (from the user's schedule file) merged with
+    their calendar events. Names both weekdays explicitly so picking the right rows out of a
+    weekly schedule isn't left to the model's own date arithmetic."""
+    now = datetime.now().astimezone()
+    schedule = t.schedule_text()
+    #str.format doesn't re-scan substituted values, so stray braces in the schedule file are safe
+    prompt = MORNING_PROMPT.format(
+        today=now.strftime("%A, %B %d"),
+        tomorrow=(now + timedelta(days=1)).strftime("%A, %B %d"),
+        schedule_section=MORNING_SCHEDULE_SECTION.format(schedule=schedule) if schedule else "",
+    )
+    #Full tool set: the injected schedule text would skew the group-selection embedding away
+    #from the google group this briefing needs, and it's one call a day - not worth the risk.
+    await _run_unprompted_check(context, prompt, "Preparing your morning briefing...", skip_if_busy=False, limit_tools=False)
 
 async def check_scheduled_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs and clears any scheduled tasks whose due time has passed, using the full tool loop

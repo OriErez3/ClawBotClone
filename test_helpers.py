@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import main
 import tools
 from tools import _is_blocked, _download_command_redirect
 from main import _chunk_message, INVALID_REPLY_PATTERN, TELEGRAM_MAX_MESSAGE_CHARS
@@ -148,6 +149,70 @@ class TestSkills(unittest.TestCase):
     def test_empty_name_rejected(self):
         result = tools.save_skill("!!!", "d", "b")
         self.assertTrue(result.startswith("Error"))
+
+
+class TestSchedule(unittest.TestCase):
+    def setUp(self):
+        #Point the schedule at a throwaway file so tests never read the real timetable
+        self._tmp = tempfile.TemporaryDirectory()
+        self._path = os.path.join(self._tmp.name, "schedule.txt")
+        self._patch = mock.patch.object(tools, "SCHEDULE_FILE", self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text):
+        with open(self._path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_missing_file_is_empty_not_an_error(self):
+        #The morning briefing relies on '' meaning "no schedule section", never an exception
+        self.assertEqual("", tools.schedule_text())
+
+    def test_reads_and_strips(self):
+        self._write("\n Monday 09:00 Linear Algebra Room 302\n\n")
+        self.assertEqual("Monday 09:00 Linear Algebra Room 302", tools.schedule_text())
+
+    def test_comment_lines_are_dropped(self):
+        self._write("# a note to myself\nMonday 09:00 Linear Algebra Room 302\n   # indented note\n")
+        self.assertEqual("Monday 09:00 Linear Algebra Room 302", tools.schedule_text())
+
+    def test_comments_only_counts_as_no_schedule(self):
+        #Copying the template without editing it must not produce a schedule section
+        self._write("# just the template header\n# nothing real yet\n")
+        self.assertEqual("", tools.schedule_text())
+
+    def test_tool_reports_missing_schedule_with_the_path(self):
+        result = tools.read_schedule()
+        self.assertIn("No class schedule saved yet", result)
+        self.assertIn(self._path, result)
+
+    def test_tool_returns_contents_and_path(self):
+        self._write("Tuesday 13:00 Organic Chemistry Lab 4")
+        result = tools.read_schedule()
+        self.assertIn("Organic Chemistry", result)
+        self.assertIn(self._path, result)
+
+    def test_tool_has_a_docstring_for_the_generated_declaration(self):
+        #from_callable builds the model-facing description from __doc__ - losing it (e.g. by
+        #concatenating a variable into the docstring) would ship a tool the model can't read
+        self.assertTrue((tools.read_schedule.__doc__ or "").strip())
+
+
+class TestMorningBriefingPrompt(unittest.TestCase):
+    def test_schedule_section_survives_braces_in_the_file(self):
+        #A user's schedule file may contain { or }; formatting must not choke or re-scan them
+        section = main.MORNING_SCHEDULE_SECTION.format(schedule="Mon 09:00 {weird} Room {1}")
+        prompt = main.MORNING_PROMPT.format(today="Monday, September 01", tomorrow="Tuesday, September 02", schedule_section=section)
+        self.assertIn("{weird}", prompt)
+        self.assertIn("Monday, September 01", prompt)
+
+    def test_prompt_without_a_schedule_still_formats(self):
+        prompt = main.MORNING_PROMPT.format(today="Monday, September 01", tomorrow="Tuesday, September 02", schedule_section="")
+        self.assertNotIn("{schedule_section}", prompt)
+        self.assertIn("calendar_list_events", prompt)
 
 
 if __name__ == "__main__":

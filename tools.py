@@ -412,6 +412,40 @@ def delete_skill(name: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+# Class schedule: a plain-text file the user maintains with their recurring weekly classes
+# (day, time, class name, room). Deliberately free-form - the model reads it, so any layout
+# a human would understand works, and the user can edit it in any text editor. Gitignored
+# alongside skills/ and memory.db: it's personal detail that doesn't belong in a public repo.
+SCHEDULE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedule.txt")
+
+def schedule_text() -> str:
+    """Returns the raw contents of the user's class-schedule file, or '' if there isn't one
+    (or it's empty/unreadable). Not a model tool - the morning briefing injects this directly,
+    so the schedule is always in the prompt without spending a tool call on it."""
+    try:
+        with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
+            #Drop '#' comment lines so the user can annotate the file (and keep the template's
+            #own header) without that text reaching the model as part of their timetable
+            lines = [ln for ln in f.read().splitlines() if not ln.strip().startswith("#")]
+    except OSError:
+        return ""
+    return "\n".join(lines).strip()
+
+def read_schedule() -> str:
+    """Reads the user's weekly class schedule - which classes they have on each day of the
+    week, at what times, and in which rooms. Use this whenever the user asks about their
+    classes, timetable, lectures, or where they need to be for school ("what do I have
+    today?", "what room is my next class in?"). The schedule recurs every week, so work out
+    the relevant weekday from the current date/time in your system info. The output ends with
+    the file's path - to change the schedule, write the full updated text back there with
+    write_file."""
+    text = schedule_text()
+    if not text:
+        return (f"No class schedule saved yet. It lives at {SCHEDULE_FILE} - one line per class "
+                "(day, time, class name, room). The user can create it themselves, or ask you "
+                "to write it there with write_file.")
+    return f"{text}\n\n(Schedule file: {SCHEDULE_FILE})"
+
 
 def schedule_task(when: str, task: str) -> str:
     """Schedules a task to be executed automatically at a specific future time, using the
