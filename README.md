@@ -16,7 +16,8 @@ The bot only responds to a single Telegram user (you). Anyone else who messages 
 - **Skills** — reusable step-by-step playbooks the bot writes for itself (markdown files in `skills/`, gitignored). Every conversation sees a one-line index; the full playbook is loaded only when a task matches, keeping prompt costs flat as knowledge grows. Teach it a procedure once ("save that as a skill") and it follows it in every future conversation.
 - **Multiple conversations** — create, list, switch, and rename separate conversation histories.
 - **Scheduled tasks** — "remind me at 5pm to..." style tasks persist in the database, survive restarts, and execute with the full tool loop.
-- **Proactive check-ins** — every hour the bot checks for unread email and upcoming calendar events and messages you only if there's something new worth flagging.
+- **Proactive check-ins** — every hour the bot checks for unread email and messages you only if something genuinely matters (a real person, a bill, a security notice — not marketing).
+- **Morning briefing** — at 8am the bot messages you what's on for today and tomorrow: your classes (time, course, room) merged with your Google Calendar events into one time-ordered list. Classes come from `schedule.txt`, a free-form text file you maintain — copy `schedule.example.txt` and fill in your timetable. It's gitignored, and you can ask about it any time ("what room is my next class in?"). No schedule file just means the briefing covers calendar events only.
 
 ## Setup
 
@@ -110,6 +111,7 @@ Then message your bot on Telegram. The first message also registers your chat as
 | `setup_bot.py` | Interactive first-time setup (see Quick start) |
 | `test_helpers.py` | Unit tests for the command guardrails, reply helpers, and skills — run with `python -m unittest test_helpers` |
 | `skills/` | The bot's saved playbooks, one markdown file each (created at runtime; gitignored — they contain machine-specific detail) |
+| `schedule.txt` | Your weekly class timetable, free-form text (gitignored; copy `schedule.example.txt` to create it) |
 | `deploy/` | Auto-deploy script + systemd units for the poll-based deployer (see below) |
 | `.github/workflows/ci.yml` | CI: runs the test suite on every push and pull request |
 
@@ -126,7 +128,7 @@ git clone <your repo url> ~/ErezBot
 scp .env credentials.json token.json memory.db user@server:~/ErezBot/
 ```
 
-Copying `token.json` matters: the Google consent flow (`setup_auth`) needs a browser, which a headless server doesn't have — but a `token.json` created elsewhere works anywhere and refreshes itself. `memory.db` is optional (brings conversations, memories, and pending scheduled tasks along), as is the `skills/` folder if you've accumulated playbooks (`scp -r skills ...`).
+Copying `token.json` matters: the Google consent flow (`setup_auth`) needs a browser, which a headless server doesn't have — but a `token.json` created elsewhere works anywhere and refreshes itself. `memory.db` is optional (brings conversations, memories, and pending scheduled tasks along), as are the `skills/` folder if you've accumulated playbooks (`scp -r skills ...`) and `schedule.txt` if you keep a class timetable.
 
 ```bash
 sudo apt update && sudo apt install -y python3-venv xvfb
@@ -189,7 +191,7 @@ journalctl -u erezbot-deploy -f     # watch deploys happen
 systemctl list-timers erezbot-deploy.timer   # see when the next check fires
 ```
 
-From then on, `git push` to main is a deploy: the bot restarts on the new code within ~2 minutes. The script uses `git reset --hard origin/main`, so never make local edits in the server checkout — they'll be discarded (untracked state — `.env`, `token.json`, `credentials.json`, `memory.db`, and the `skills/` folder — is safe).
+From then on, `git push` to main is a deploy: the bot restarts on the new code within ~2 minutes. The script uses `git reset --hard origin/main`, so never make local edits in the server checkout — they'll be discarded (untracked state — `.env`, `token.json`, `credentials.json`, `memory.db`, `schedule.txt`, and the `skills/` folder — is safe).
 
 ## Security notes
 
