@@ -482,17 +482,22 @@ def _leetcode_sheet_id() -> str:
     match = _SHEET_ID_RE.search(raw)
     return match.group(1) if match else raw
 
-def log_leetcode_result(problem: str, got_it: str, notes: str = "") -> str:
-    """Records how ONE of today's assigned LeetCode problems went. Call this once per problem
-    as soon as the user tells you how it went - it writes the row to their tracker spreadsheet
-    AND updates the local history the morning picks are based on, so don't also call
-    sheets_append for it. When every assigned problem is logged, today's assignment clears
-    itself and the evening reminder goes quiet.
+def log_leetcode_result(problem: str, got_it: str, notes: str = "", topic: str = "") -> str:
+    """Records how ONE LeetCode problem went. Call this once per problem as soon as the user
+    says how it went - it writes the row to their tracker spreadsheet AND updates the local
+    history the morning picks are based on, so don't also call sheets_append for it. When every
+    problem assigned today is logged, the assignment clears and the evening reminder goes quiet.
+
+    Works for ANY problem, not only today's pair: the user also does extra problems and catches
+    up on old ones, and those count too. For a problem that isn't today's and isn't in their
+    practice queue, pass the topic yourself (e.g. 'Linked List', 'Dynamic Programming') since
+    there's nowhere to look it up.
 
     Args:
-        problem: The problem's name, exactly as it was assigned this morning.
+        problem: The problem's name, e.g. 'Merge Two Sorted Lists'.
         got_it: Exactly one of 'yes' (solved it), 'partly' (got there with hints or too slowly), or 'no' (couldn't).
         notes: The user's own comment in their words - what tripped them up, what they'd revisit. Empty if they didn't say.
+        topic: The problem's topic. Only needed for problems outside today's assignment and the queue; otherwise leave empty and it's looked up.
     """
     got_it = (got_it or "").strip().lower()
     if got_it not in database.GOT_IT_SCORES:
@@ -502,30 +507,44 @@ def log_leetcode_result(problem: str, got_it: str, notes: str = "") -> str:
         problems = (json.loads(raw) if raw else {}).get("problems") or []
     except ValueError:
         problems = []
-    if not problems:
-        return "There's no LeetCode assignment outstanding right now - nothing to log."
-    match = next((p for p in problems if p[0].strip().lower() == problem.strip().lower()), None)
-    if match is None:
-        names = ", ".join(p[0] for p in problems)
-        return f"'{problem}' isn't one of today's problems. Outstanding: {names}."
-    topic = match[1] if len(match) > 1 else ""
+    #Resolve the name and topic from the most authoritative source available, so the sheet keeps
+    #one spelling per problem: today's assignment, then the practice queue, then whatever the
+    #caller supplied for a problem that exists in neither (an extra the user did on their own).
+    wanted = problem.strip().lower()
+    match = next((p for p in problems if p[0].strip().lower() == wanted), None)
+    if match is not None:
+        name, resolved_topic = match[0], (match[1] if len(match) > 1 else "")
+    else:
+        entry = next((q for q in leetcode_queue() if q[0].strip().lower() == wanted), None)
+        if entry is not None:
+            name, resolved_topic = entry
+        else:
+            name, resolved_topic = problem.strip(), topic.strip()
+    if not resolved_topic:
+        return (f"'{name}' isn't today's assignment or in the practice queue, so I need its topic "
+                "to file it. Call this again with topic set (e.g. topic='Linked List').")
     sheet_id = _leetcode_sheet_id()
     if not sheet_id:
         return ("No tracker spreadsheet is saved yet. Ask the user for the link to their LeetCode "
                 "sheet, save it with save_memory under the key 'leetcode_sheet_id', then call this again.")
     #Sheet first: if the user-visible record fails to write, log nothing locally, so the two
     #never drift apart and the problem stays outstanding for a retry.
-    appended = gs.sheets_append(sheet_id, json.dumps([[match[0], topic, got_it, notes]]))
+    appended = gs.sheets_append(sheet_id, json.dumps([[name, resolved_topic, got_it, notes]]))
     if appended.startswith("Error"):
         return f"Nothing was logged - writing to the spreadsheet failed: {appended}"
-    database.add_leetcode_attempt(match[0], topic, got_it, notes)
+    database.add_leetcode_attempt(name, resolved_topic, got_it, notes)
+    if match is None:
+        #An extra problem, not today's pair - today's assignment stays outstanding
+        outstanding = ", ".join(p[0] for p in problems)
+        return (f"Logged '{name}' ({resolved_topic}, {got_it})."
+                + (f" Today's assignment is still outstanding: {outstanding}." if outstanding else ""))
     remaining = [p for p in problems if p is not match]
     if remaining:
         set_setting("leetcode_pending", json.dumps({"date": datetime.now().strftime("%Y-%m-%d"),
                                                     "problems": remaining}))
-        return f"Logged '{match[0]}' ({got_it}). Still outstanding: {', '.join(p[0] for p in remaining)}."
+        return f"Logged '{name}' ({got_it}). Still outstanding: {', '.join(p[0] for p in remaining)}."
     set_setting("leetcode_pending", "")
-    return f"Logged '{match[0]}' ({got_it}). That's both of today's problems done - assignment cleared."
+    return f"Logged '{name}' ({got_it}). That's today's assignment done - cleared."
 
 def schedule_task(when: str, task: str) -> str:
     """Schedules a task to be executed automatically at a specific future time, using the

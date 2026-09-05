@@ -388,10 +388,19 @@ class TestLeetcodeLogging(unittest.TestCase):
         self.assertTrue(result.startswith("Error"))
         self.assertEqual([], self.appended)
 
-    def test_unknown_problem_is_refused_with_the_real_list(self):
+    def test_problem_outside_the_queue_needs_a_topic(self):
+        #Nowhere to look one up, and a blank topic would break the weak-topic stats
         result = tools.log_leetcode_result("Two Sum", "yes")
-        self.assertIn("Sort List", result)
+        self.assertIn("topic", result)
         self.assertEqual([], self.appended)
+
+    def test_extra_problem_logs_without_touching_todays_assignment(self):
+        #The user does problems outside the assigned pair; those count, but must not clear it
+        result = tools.log_leetcode_result("Merge Two Sorted Lists", "yes", "clean", topic="Linked List")
+        self.assertIn("Logged", result)
+        self.assertEqual([["Merge Two Sorted Lists", "Linked List", "yes", "clean"]], self.appended[0][1])
+        still = json.loads(self.settings["leetcode_pending"])["problems"]
+        self.assertEqual([["Sort List", "Linked List"], ["Triangle", "DP"]], still)
 
     def test_nothing_is_logged_locally_when_the_sheet_write_fails(self):
         #The sheet is the user's record - if it didn't take, local history must not drift ahead
@@ -406,6 +415,47 @@ class TestLeetcodeLogging(unittest.TestCase):
             result = tools.log_leetcode_result("Sort List", "yes")
         self.assertIn("save_memory", result)
         self.assertEqual([], self.appended)
+
+
+class TestLeetcodeAssignmentAdvances(unittest.TestCase):
+    """Regression: progress must advance when a problem is ASSIGNED, not when it's reported.
+    While done-ness came only from logging, a user who never reported got the same two
+    problems every single morning forever."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        path = os.path.join(self._tmp.name, "leetcode.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(f"P{i} | T{i}\n" for i in range(8)))
+        self.settings, self.done = {}, set()
+        self._patches = [
+            mock.patch.object(tools, "LEETCODE_FILE", path),
+            mock.patch.object(database, "get_setting", lambda k: self.settings.get(k)),
+            mock.patch.object(database, "set_setting", lambda k, v: self.settings.__setitem__(k, v)),
+            mock.patch.object(database, "leetcode_topic_stats", lambda n: []),
+            mock.patch.object(database, "leetcode_done_problems", lambda: self.done),
+            #Stands in for the real table write: assignment is what grows the done-set
+            mock.patch.object(database, "mark_leetcode_assigned",
+                              lambda picked: self.done.update(n for n, _ in picked)),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_three_mornings_without_reporting_give_three_different_pairs(self):
+        days = [[n for n, _ in main._assign_leetcode()[0]] for _ in range(3)]
+        flat = [n for day in days for n in day]
+        self.assertEqual(6, len(flat))
+        self.assertEqual(len(flat), len(set(flat)), f"repeated a problem across days: {days}")
+
+    def test_assignment_is_recorded_before_the_pending_state(self):
+        picked, _ = main._assign_leetcode()
+        #Both must be marked used even though nothing has been reported
+        self.assertEqual({n for n, _ in picked}, self.done)
 
 
 class TestLeetcodePendingBlock(unittest.TestCase):

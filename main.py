@@ -1200,6 +1200,10 @@ def _assign_leetcode() -> tuple:
                                         database.leetcode_topic_stats(LEETCODE_MIN_ATTEMPTS))
     if not picked:
         return [], None
+    #Mark them handed out BEFORE anything else can fail. Progress has to advance on assignment,
+    #not on reporting: when it depended on reporting, never reporting meant the same two
+    #problems came back every morning forever.
+    database.mark_leetcode_assigned(picked)
     #Overwrites any assignment the user never reported on - a skipped day leaves no sheet row
     database.set_setting("leetcode_pending", json.dumps({
         "date": datetime.now().strftime("%Y-%m-%d"),
