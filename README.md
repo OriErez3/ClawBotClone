@@ -60,6 +60,7 @@ ALLOWED_USER_ID=<your numeric Telegram user id>
 Optional extras:
 
 - `GEMINI_MODEL=<model name>` — use a different Gemini model (defaults to `gemini-3.1-flash-lite`).
+- `TIMEZONE=<IANA name>` — the timezone for the daily jobs (morning briefing, LeetCode reminder). Defaults to `America/New_York`. This matters: python-telegram-bot reads a naive time as **UTC**, so without it an 8am briefing fires at 8am UTC.
 - `BROWSER_HEADLESS=true` — run the automation browser without a window. Needed on machines with no display, unless you run the bot under `xvfb-run` (preferred — some sites bot-detect headless Chromium).
 
 ### 3. Connect your Google account

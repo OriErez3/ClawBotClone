@@ -456,6 +456,51 @@ def read_schedule() -> str:
 # Gitignored like schedule.txt: it's personal progress, not repo content.
 LEETCODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leetcode.txt")
 
+#Everything below this line in leetcode.txt has already been handed out. The entries are moved
+#there commented-out, so leetcode_queue() (which skips '#' lines) ignores them automatically and
+#the file stays one readable list: what's coming on top, what's been used underneath. To put a
+#problem back, delete its '#' prefix and move the line up.
+LEETCODE_DONE_MARKER = "# ---- handed out (most recent last) ----"
+
+def pop_leetcode(names: list) -> int:
+    """Moves the named problems out of the active queue into the handed-out section, and returns
+    how many moved. Called when problems are ASSIGNED, so the file itself records what's been
+    consumed - the queue no longer depends on the user reporting anything, and what the bot
+    knows is exactly what the user can see by opening the file.
+
+    Writes via a temp file and os.replace so an interrupted write can't truncate the queue."""
+    try:
+        with open(LEETCODE_FILE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return 0
+    wanted = {n.strip().lower() for n in names}
+    marker_at = next((i for i, l in enumerate(lines) if l.strip() == LEETCODE_DONE_MARKER), None)
+    active = lines[:marker_at] if marker_at is not None else lines
+    done = lines[marker_at + 1:] if marker_at is not None else []
+    today = datetime.now().strftime("%Y-%m-%d")
+    kept, moved = [], []
+    for line in active:
+        name = line.split("|")[0].strip().lower()
+        if name in wanted and not line.strip().startswith("#") and line.strip():
+            moved.append(f"# {today}  {line.strip()}")
+        else:
+            kept.append(line)
+    if not moved:
+        return 0
+    while kept and not kept[-1].strip():
+        kept.pop()  #keep exactly one blank line before the marker
+    out = kept + ["", LEETCODE_DONE_MARKER] + done + moved
+    tmp = LEETCODE_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, LEETCODE_FILE)
+    except OSError as e:
+        logger.warning("Could not update the LeetCode queue file: %s", e)
+        return 0
+    return len(moved)
+
 def leetcode_queue() -> list:
     """Returns the practice queue as [(name, topic)], or [] if there's no file, it's empty, or
     it can't be read. Topic is '' on a line with no '|'. Not a model tool - the morning briefing

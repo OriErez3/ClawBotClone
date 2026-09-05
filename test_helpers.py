@@ -255,66 +255,103 @@ class TestLeetcodeQueue(unittest.TestCase):
 
 
 class TestLeetcodePick(unittest.TestCase):
-    """The tutor selection itself - pure, so it needs no database or files."""
+    """Selection is pure: the queue passed in is already only the un-handed-out problems,
+    because assignment pops them from the file."""
     QUEUE = [("A", "Arrays"), ("B", "Trees"), ("C", "Arrays"), ("D", "Graphs"), ("E", "Trees")]
 
     def test_no_stats_yet_walks_the_queue_in_order(self):
-        #Before there's enough history, it behaves exactly like the plain sequential walk
-        picked, weak = main._pick_leetcode(self.QUEUE, set(), [])
+        picked, weak = main._pick_leetcode(self.QUEUE, [])
         self.assertEqual([("A", "Arrays"), ("B", "Trees")], picked)
         self.assertIsNone(weak)
 
-    def test_skips_problems_already_attempted(self):
-        picked, _ = main._pick_leetcode(self.QUEUE, {"A", "B"}, [])
-        self.assertEqual([("C", "Arrays"), ("D", "Graphs")], picked)
-
     def test_second_pick_drills_the_weakest_topic(self):
-        stats = [{"topic": "Trees", "attempts": 4, "score": 0.1}]
-        picked, weak = main._pick_leetcode(self.QUEUE, set(), stats)
-        self.assertEqual("A", picked[0][0])       # still moving through the queue
-        self.assertEqual(("B", "Trees"), picked[1])  # steered to the weak topic
+        picked, weak = main._pick_leetcode(self.QUEUE, [{"topic": "Trees", "attempts": 4, "score": 0.1}])
+        self.assertEqual([("A", "Arrays"), ("B", "Trees")], picked)
         self.assertEqual("Trees", weak)
 
     def test_drill_reaches_past_the_next_in_line(self):
-        stats = [{"topic": "Graphs", "attempts": 3, "score": 0.0}]
-        picked, weak = main._pick_leetcode(self.QUEUE, set(), stats)
+        picked, weak = main._pick_leetcode(self.QUEUE, [{"topic": "Graphs", "attempts": 3, "score": 0.0}])
         self.assertEqual([("A", "Arrays"), ("D", "Graphs")], picked)
         self.assertEqual("Graphs", weak)
 
     def test_does_not_make_the_whole_day_one_topic(self):
-        #When the queue's next problem is already the weak topic, the second must vary rather
-        #than doubling down - otherwise a bad streak turns every day into a single subject
-        stats = [{"topic": "Arrays", "attempts": 4, "score": 0.2}]
-        picked, weak = main._pick_leetcode(self.QUEUE, set(), stats)
-        self.assertEqual(("A", "Arrays"), picked[0])
-        self.assertEqual(("B", "Trees"), picked[1])
+        #When the queue's next problem is already the weak topic, the second must vary
+        picked, weak = main._pick_leetcode(self.QUEUE, [{"topic": "Arrays", "attempts": 4, "score": 0.2}])
+        self.assertEqual([("A", "Arrays"), ("B", "Trees")], picked)
         self.assertEqual("Arrays", weak)
 
     def test_weak_topic_with_nothing_left_falls_back_quietly(self):
-        #Every Graphs problem is done, so it can't drill - and must not claim it did
-        stats = [{"topic": "Graphs", "attempts": 3, "score": 0.0}]
-        picked, weak = main._pick_leetcode(self.QUEUE, {"D"}, stats)
+        #Can't drill Graphs if no Graphs problem remains - and must not claim it did
+        queue = [p for p in self.QUEUE if p[0] != "D"]
+        picked, weak = main._pick_leetcode(queue, [{"topic": "Graphs", "attempts": 3, "score": 0.0}])
         self.assertEqual([("A", "Arrays"), ("B", "Trees")], picked)
         self.assertIsNone(weak)
 
     def test_exhausted_queue_hands_out_nothing(self):
-        picked, weak = main._pick_leetcode(self.QUEUE, {"A", "B", "C", "D", "E"}, [])
-        self.assertEqual([], picked)
-        self.assertIsNone(weak)
+        self.assertEqual(([], None), main._pick_leetcode([], []))
+
+
+class TestLeetcodePop(unittest.TestCase):
+    """The queue file is the source of truth for what's left, so popping is what stops a
+    problem being handed out twice - not any database state."""
+    QUEUE = "# header\nA | Arrays\nB | Trees\nC | Graphs\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "leetcode.txt")
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(self.QUEUE)
+        self._patch = mock.patch.object(tools, "LEETCODE_FILE", self.path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def test_popped_problems_leave_the_queue(self):
+        self.assertEqual(2, tools.pop_leetcode(["A", "B"]))
+        self.assertEqual([("C", "Graphs")], tools.leetcode_queue())
+
+    def test_popped_problems_are_kept_in_the_file_not_destroyed(self):
+        tools.pop_leetcode(["A"])
+        text = open(self.path).read()
+        self.assertIn(tools.LEETCODE_DONE_MARKER, text)
+        self.assertIn("A | Arrays", text)          # still recorded...
+        self.assertNotIn(("A", "Arrays"), tools.leetcode_queue())  # ...but not offered
+
+    def test_popping_is_idempotent(self):
+        self.assertEqual(1, tools.pop_leetcode(["A"]))
+        self.assertEqual(0, tools.pop_leetcode(["A"]))
+        self.assertEqual(2, len(tools.leetcode_queue()))
+
+    def test_unknown_name_changes_nothing(self):
+        before = open(self.path).read()
+        self.assertEqual(0, tools.pop_leetcode(["Nonexistent"]))
+        self.assertEqual(before, open(self.path).read())
+
+    def test_repeated_pops_accumulate_under_one_marker(self):
+        tools.pop_leetcode(["A"])
+        tools.pop_leetcode(["B"])
+        text = open(self.path).read()
+        self.assertEqual(1, text.count(tools.LEETCODE_DONE_MARKER))
+        self.assertEqual([("C", "Graphs")], tools.leetcode_queue())
+
+    def test_missing_file_is_a_no_op(self):
+        with mock.patch.object(tools, "LEETCODE_FILE", "/nonexistent/leetcode.txt"):
+            self.assertEqual(0, tools.pop_leetcode(["A"]))
 
 
 class TestLeetcodeAssignment(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        path = os.path.join(self._tmp.name, "leetcode.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("A | Arrays\nB | Trees\n")
+        self.path = os.path.join(self._tmp.name, "leetcode.txt")
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("".join(f"P{i} | T{i}\n" for i in range(8)))
         self.settings = {}
         self._patches = [
-            mock.patch.object(tools, "LEETCODE_FILE", path),
+            mock.patch.object(tools, "LEETCODE_FILE", self.path),
             mock.patch.object(database, "get_setting", lambda k: self.settings.get(k)),
             mock.patch.object(database, "set_setting", lambda k, v: self.settings.__setitem__(k, v)),
-            mock.patch.object(database, "leetcode_done_problems", lambda: set()),
             mock.patch.object(database, "leetcode_topic_stats", lambda n: []),
         ]
         for p in self._patches:
@@ -327,135 +364,27 @@ class TestLeetcodeAssignment(unittest.TestCase):
 
     def test_records_the_pending_assignment(self):
         picked, _ = main._assign_leetcode()
-        self.assertEqual([("A", "Arrays"), ("B", "Trees")], picked)
+        self.assertEqual([("P0", "T0"), ("P1", "T1")], picked)
         pending = json.loads(self.settings["leetcode_pending"])
-        self.assertEqual([["A", "Arrays"], ["B", "Trees"]], pending["problems"])
-        self.assertIn("date", pending)
+        self.assertEqual([["P0", "T0"], ["P1", "T1"]], pending["problems"])
+
+    def test_three_mornings_give_three_different_pairs(self):
+        #The regression that started all this: with consumption tied to reporting, a user who
+        #never reported got the same two problems every single morning.
+        days = [[n for n, _ in main._assign_leetcode()[0]] for _ in range(3)]
+        flat = [n for day in days for n in day]
+        self.assertEqual(6, len(set(flat)), f"repeated a problem across days: {days}")
+
+    def test_assignment_pops_the_pair_from_the_file(self):
+        picked, _ = main._assign_leetcode()
+        remaining = {n for n, _ in tools.leetcode_queue()}
+        self.assertTrue(remaining.isdisjoint({n for n, _ in picked}))
+        self.assertEqual(6, len(remaining))
 
     def test_no_queue_file_means_the_feature_is_off(self):
         with mock.patch.object(tools, "LEETCODE_FILE", "/nonexistent/leetcode.txt"):
             self.assertEqual(([], None), main._assign_leetcode())
         self.assertNotIn("leetcode_pending", self.settings)
-
-
-class TestLeetcodeLogging(unittest.TestCase):
-    PENDING = {"date": "2026-09-02", "problems": [["Sort List", "Linked List"], ["Triangle", "DP"]]}
-
-    def setUp(self):
-        self.settings = {"leetcode_pending": json.dumps(self.PENDING)}
-        self.appended = []
-        self.logged = []
-        self._patches = [
-            mock.patch.object(tools, "get_setting", lambda k: self.settings.get(k)),
-            mock.patch.object(tools, "set_setting", lambda k, v: self.settings.__setitem__(k, v)),
-            mock.patch.object(database, "get_memory", lambda k: "https://docs.google.com/spreadsheets/d/SHEET123/edit#gid=0"),
-            mock.patch.object(database, "add_leetcode_attempt",
-                              lambda *a, **kw: self.logged.append(a)),
-            mock.patch.object(tools.gs, "sheets_append",
-                              lambda sid, vals, **kw: self.appended.append((sid, json.loads(vals))) or "Appended 1 row(s)."),
-        ]
-        for p in self._patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
-
-    def test_extracts_the_sheet_id_from_a_pasted_url(self):
-        tools.log_leetcode_result("Sort List", "yes", "clean")
-        self.assertEqual("SHEET123", self.appended[0][0])
-
-    def test_writes_the_columns_in_sheet_order(self):
-        tools.log_leetcode_result("Sort List", "partly", "merge sort was fiddly")
-        self.assertEqual([["Sort List", "Linked List", "partly", "merge sort was fiddly"]], self.appended[0][1])
-        self.assertEqual(("Sort List", "Linked List", "partly", "merge sort was fiddly"), self.logged[0])
-
-    def test_first_of_two_leaves_the_other_outstanding(self):
-        result = tools.log_leetcode_result("Sort List", "yes")
-        self.assertIn("Triangle", result)
-        self.assertEqual([["Triangle", "DP"]], json.loads(self.settings["leetcode_pending"])["problems"])
-
-    def test_logging_both_clears_the_assignment(self):
-        tools.log_leetcode_result("Sort List", "yes")
-        tools.log_leetcode_result("Triangle", "no", "no idea on the recurrence")
-        self.assertEqual("", self.settings["leetcode_pending"])
-
-    def test_problem_name_is_matched_case_insensitively(self):
-        self.assertIn("Logged", tools.log_leetcode_result("sort list", "yes"))
-
-    def test_rejects_an_invalid_got_it_value(self):
-        result = tools.log_leetcode_result("Sort List", "kinda")
-        self.assertTrue(result.startswith("Error"))
-        self.assertEqual([], self.appended)
-
-    def test_problem_outside_the_queue_needs_a_topic(self):
-        #Nowhere to look one up, and a blank topic would break the weak-topic stats
-        result = tools.log_leetcode_result("Two Sum", "yes")
-        self.assertIn("topic", result)
-        self.assertEqual([], self.appended)
-
-    def test_extra_problem_logs_without_touching_todays_assignment(self):
-        #The user does problems outside the assigned pair; those count, but must not clear it
-        result = tools.log_leetcode_result("Merge Two Sorted Lists", "yes", "clean", topic="Linked List")
-        self.assertIn("Logged", result)
-        self.assertEqual([["Merge Two Sorted Lists", "Linked List", "yes", "clean"]], self.appended[0][1])
-        still = json.loads(self.settings["leetcode_pending"])["problems"]
-        self.assertEqual([["Sort List", "Linked List"], ["Triangle", "DP"]], still)
-
-    def test_nothing_is_logged_locally_when_the_sheet_write_fails(self):
-        #The sheet is the user's record - if it didn't take, local history must not drift ahead
-        with mock.patch.object(tools.gs, "sheets_append", lambda *a, **kw: "Error: quota exceeded"):
-            result = tools.log_leetcode_result("Sort List", "yes")
-        self.assertIn("Nothing was logged", result)
-        self.assertEqual([], self.logged)
-        self.assertIn("Sort List", self.settings["leetcode_pending"])
-
-    def test_missing_sheet_id_asks_for_it_instead_of_failing(self):
-        with mock.patch.object(database, "get_memory", lambda k: None):
-            result = tools.log_leetcode_result("Sort List", "yes")
-        self.assertIn("save_memory", result)
-        self.assertEqual([], self.appended)
-
-
-class TestLeetcodeAssignmentAdvances(unittest.TestCase):
-    """Regression: progress must advance when a problem is ASSIGNED, not when it's reported.
-    While done-ness came only from logging, a user who never reported got the same two
-    problems every single morning forever."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        path = os.path.join(self._tmp.name, "leetcode.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("".join(f"P{i} | T{i}\n" for i in range(8)))
-        self.settings, self.done = {}, set()
-        self._patches = [
-            mock.patch.object(tools, "LEETCODE_FILE", path),
-            mock.patch.object(database, "get_setting", lambda k: self.settings.get(k)),
-            mock.patch.object(database, "set_setting", lambda k, v: self.settings.__setitem__(k, v)),
-            mock.patch.object(database, "leetcode_topic_stats", lambda n: []),
-            mock.patch.object(database, "leetcode_done_problems", lambda: self.done),
-            #Stands in for the real table write: assignment is what grows the done-set
-            mock.patch.object(database, "mark_leetcode_assigned",
-                              lambda picked: self.done.update(n for n, _ in picked)),
-        ]
-        for p in self._patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
-        self._tmp.cleanup()
-
-    def test_three_mornings_without_reporting_give_three_different_pairs(self):
-        days = [[n for n, _ in main._assign_leetcode()[0]] for _ in range(3)]
-        flat = [n for day in days for n in day]
-        self.assertEqual(6, len(flat))
-        self.assertEqual(len(flat), len(set(flat)), f"repeated a problem across days: {days}")
-
-    def test_assignment_is_recorded_before_the_pending_state(self):
-        picked, _ = main._assign_leetcode()
-        #Both must be marked used even though nothing has been reported
-        self.assertEqual({n for n, _ in picked}, self.done)
 
 
 class TestLeetcodePendingBlock(unittest.TestCase):

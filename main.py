@@ -1,5 +1,5 @@
 import telegram
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes, CommandHandler, Defaults, MessageHandler, filters
 from dotenv import load_dotenv
 import os
 import asyncio
@@ -19,6 +19,7 @@ import json
 import logging
 import re
 from datetime import datetime, time as dt_time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 load_dotenv()
 logging.basicConfig(
@@ -39,6 +40,15 @@ if allowed_user_id is None:
 ALLOWED_USER_ID = int(allowed_user_id)
 #Optional override so trying a different model doesn't require a code change
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+#python-telegram-bot reads a naive datetime.time as UTC, NOT as the machine's local time, so
+#every run_daily job needs an explicit zone or it silently fires at the wrong hour (8am became
+#4am and the 8pm nudge became 4pm). Set TIMEZONE in .env to an IANA name; a real zone rather
+#than a fixed offset so the hour survives daylight saving.
+try:
+    TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
+except Exception:
+    logger.warning("Unknown TIMEZONE %r - falling back to America/New_York", os.getenv("TIMEZONE"))
+    TIMEZONE = ZoneInfo("America/New_York")
 
 client = genai.Client(api_key=gemini_key)
 
@@ -357,7 +367,7 @@ CHECKIN_PROMPT = (
 #Calendar lives here, not in the hourly check-in: a once-a-day briefing means the user hears
 #about an event once (in the morning) instead of every hour. Runs at MORNING_BRIEFING_HOUR
 #in the server's local timezone.
-MORNING_BRIEFING_HOUR = 8
+MORNING_BRIEFING_HOUR = 8  #local time - see TIMEZONE
 #Built fresh at fire time (see morning_briefing) so the two weekday names and the user's class
 #schedule are baked straight in. The schedule is injected rather than fetched via read_schedule:
 #the briefing ALWAYS needs it, so spending a tool call - and risking the model skipping it - buys
@@ -377,7 +387,7 @@ MORNING_PROMPT = (
     "exactly: NOTHING_TO_REPORT"
 )
 LEETCODE_PER_DAY = 2
-LEETCODE_NUDGE_HOUR = 20  #server-local, like MORNING_BRIEFING_HOUR
+LEETCODE_NUDGE_HOUR = 20  #local time - see TIMEZONE
 MORNING_LEETCODE_SECTION = (
     "Today's two LeetCode problems for the user - already chosen, do NOT substitute, reorder or "
     "add to them:\n{problems}\n\nList them at the very end of the briefing under a 'LeetCode' "
@@ -1160,18 +1170,18 @@ async def proactive_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 LEETCODE_MIN_ATTEMPTS = 2  #a topic needs this many attempts before it counts as a weakness
 
-def _pick_leetcode(queue: list, done: set, stats: list) -> tuple:
+def _pick_leetcode(queue: list, stats: list) -> tuple:
     """Chooses today's problems: one to keep moving through the queue, one to drill the weakest
     topic. Returns (picked, weak_topic_or_None) where weak_topic is set only when the second
     pick was actually steered by it - the briefing uses that to explain itself.
 
-    Both picks come from `queue` (the file), so a problem that doesn't exist can't be assigned,
-    and both skip `done`, so nothing repeats. `stats` is worst-topic-first."""
-    remaining = [p for p in queue if p[0] not in done]
-    if not remaining:
-        return [], None  #whole queue attempted - nothing left to hand out
-    first = remaining[0]  #queue order is the seed shuffle: "next unused"
-    rest = remaining[1:]
+    `queue` is already only the un-handed-out problems: assigned ones are moved to the bottom of
+    leetcode.txt at handout, so there's no done-set to consult. Both picks come from the file,
+    so a problem that doesn't exist can't be assigned. `stats` is worst-topic-first."""
+    if not queue:
+        return [], None  #whole queue handed out - nothing left
+    first = queue[0]  #queue order is the seed shuffle: "next un-handed-out"
+    rest = queue[1:]
     weak_topic = stats[0]["topic"] if stats else None
     second = None
     if weak_topic and first[1] == weak_topic:
@@ -1188,22 +1198,24 @@ def _pick_leetcode(queue: list, done: set, stats: list) -> tuple:
     return picked[:LEETCODE_PER_DAY], weak_topic
 
 def _assign_leetcode() -> tuple:
-    """Picks the day's problems and records them as pending. Returns (picked, weak_topic) -
-    ([], None) when there's no queue file, which is what makes the whole feature opt-in.
+    """Picks the day's problems, pops them from the queue file, and records them as pending.
+    Returns (picked, weak_topic) - ([], None) when there's no queue file, which is what makes
+    the whole feature opt-in.
 
-    Selection reads only the local leetcode_log, never the tracker sheet, so it isn't subject
-    to sheets_read's 100-row cap the way "pick two I haven't done yet" would be."""
+    Selection never reads the tracker sheet, so it isn't subject to sheets_read's 100-row cap
+    the way "pick two I haven't done yet" would be. The database is consulted only for topic
+    difficulty; which problems remain is entirely the file's business."""
     queue = t.leetcode_queue()
     if not queue:
         return [], None
-    picked, weak_topic = _pick_leetcode(queue, database.leetcode_done_problems(),
-                                        database.leetcode_topic_stats(LEETCODE_MIN_ATTEMPTS))
+    picked, weak_topic = _pick_leetcode(queue, database.leetcode_topic_stats(LEETCODE_MIN_ATTEMPTS))
     if not picked:
         return [], None
-    #Mark them handed out BEFORE anything else can fail. Progress has to advance on assignment,
-    #not on reporting: when it depended on reporting, never reporting meant the same two
-    #problems came back every morning forever.
-    database.mark_leetcode_assigned(picked)
+    #Pop them from the queue file BEFORE anything else can fail. Consumption happens at handout,
+    #not at reporting: when it depended on reporting, never reporting meant the same two problems
+    #came back every morning. Keeping it in the file also means the state is visible - what the
+    #bot knows is exactly what you see when you open leetcode.txt.
+    t.pop_leetcode([name for name, _ in picked])
     #Overwrites any assignment the user never reported on - a skipped day leaves no sheet row
     database.set_setting("leetcode_pending", json.dumps({
         "date": datetime.now().strftime("%Y-%m-%d"),
@@ -1321,7 +1333,7 @@ def main() -> None:
     user_filter = filters.User(user_id=ALLOWED_USER_ID)
     #concurrent_updates so a confirmation reply is processed while the tool loop awaits it -
     #the default sequential mode would deadlock (the awaiting handler blocks the next update)
-    application = ApplicationBuilder().token(telegram_key).post_init(_post_init).concurrent_updates(True).build() # type: ignore
+    application = ApplicationBuilder().token(telegram_key).post_init(_post_init).defaults(Defaults(tzinfo=TIMEZONE)).concurrent_updates(True).build() # type: ignore
     application.add_handler(CommandHandler("start", start, filters=user_filter))
     application.add_handler(CallbackQueryHandler(on_confirm_button, pattern=r"^confirm_"))
     application.add_handler(CommandHandler("cancel", cancel, filters=user_filter))
@@ -1346,11 +1358,11 @@ def main() -> None:
     )
     application.job_queue.run_daily( #type: ignore
         morning_briefing,
-        time=dt_time(hour=MORNING_BRIEFING_HOUR, minute=0),  #server-local time (set the box's tz)
+        time=dt_time(hour=MORNING_BRIEFING_HOUR, minute=0, tzinfo=TIMEZONE),
     )
     application.job_queue.run_daily( #type: ignore
         leetcode_nudge,
-        time=dt_time(hour=LEETCODE_NUDGE_HOUR, minute=0),
+        time=dt_time(hour=LEETCODE_NUDGE_HOUR, minute=0, tzinfo=TIMEZONE),
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, respond))
     application.add_handler(MessageHandler(filters.PHOTO & user_filter, respond_photo))

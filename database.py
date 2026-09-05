@@ -208,51 +208,25 @@ def read_memory():
 #free text. The tool that writes the log constrains got_it to these three values.
 GOT_IT_SCORES = {"yes": 1.0, "partly": 0.5, "no": 0.0}
 
-def mark_leetcode_assigned(problems: list) -> None:
-    """Records [(name, topic)] as handed out, with an empty got_it meaning 'assigned, not yet
-    reported'. Called at assignment time so the morning pick advances even when the user never
-    tells the bot how it went - otherwise `done` stays empty and the same two problems are
-    re-assigned every single day."""
-    if not problems:
-        return
-    with _lock:
-        cursor.executemany(
-            "INSERT INTO leetcode_log (problem, topic, got_it, notes) VALUES (?, ?, '', '')",
-            [(name, topic) for name, topic in problems],
-        )
-        conn.commit()
-
 def add_leetcode_attempt(problem: str, topic: str, got_it: str, notes: str = "") -> None:
     """Records how an attempt went, after the row is appended to the user's sheet so the local
-    table and the sheet stay in step. Fills in the row left by mark_leetcode_assigned rather
-    than adding a second one; inserts only if the problem was never assigned (logged manually)."""
+    table and the sheet stay in step. This table is now purely about RESULTS - which problems
+    are still available to hand out is the queue file's business, not the database's."""
     with _lock:
         cursor.execute(
-            "UPDATE leetcode_log SET got_it = ?, notes = ?, logged = unixepoch() WHERE id = ("
-            "  SELECT id FROM leetcode_log WHERE problem = ? AND got_it = '' ORDER BY id DESC LIMIT 1)",
-            (got_it, notes, problem),
+            "INSERT INTO leetcode_log (problem, topic, got_it, notes) VALUES (?, ?, ?, ?)",
+            (problem, topic, got_it, notes),
         )
-        if cursor.rowcount == 0:
-            cursor.execute(
-                "INSERT INTO leetcode_log (problem, topic, got_it, notes) VALUES (?, ?, ?, ?)",
-                (problem, topic, got_it, notes),
-            )
         conn.commit()
-
-def leetcode_done_problems() -> set:
-    """Every problem name already attempted - the morning pick skips these, which is what
-    replaces the old sequential pointer once selection is allowed to jump between topics."""
-    with _lock:
-        rows = cursor.execute("SELECT DISTINCT problem FROM leetcode_log").fetchall()
-    return {r[0] for r in rows}
 
 def leetcode_topic_stats(min_attempts: int = 2) -> list:
     """Per-topic difficulty, hardest first: [{'topic', 'attempts', 'score'}] where score is the
     mean of GOT_IT_SCORES (0 = never got one, 1 = got them all). Topics with fewer than
     `min_attempts` are excluded so a single bad day can't brand a whole topic as a weakness.
 
-    Only reported rows count: an assigned-but-unreported row has got_it = '', which the CASE
-    would otherwise score 0 and turn every un-reported topic into a phantom weakness."""
+    Only rows with a real got_it count. Nothing writes got_it = '' any more, but an earlier
+    version marked assignments that way and those rows are still in the database - without this
+    they would score 0 and turn their topics into phantom weaknesses."""
     case = " ".join(f"WHEN '{k}' THEN {v}" for k, v in GOT_IT_SCORES.items())
     with _lock:
         rows = cursor.execute(
